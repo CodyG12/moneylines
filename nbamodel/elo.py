@@ -47,6 +47,7 @@ def compute_elo(games: pd.DataFrame, config: EloConfig = EloConfig()):
     season = games["season"].to_numpy()
     played = games["played"].to_numpy()
     margin = (games["home_score"] - games["away_score"]).to_numpy()
+    hca = np.where(games["neutral_site"].to_numpy(), 0.0, config.home_advantage)
 
     groups = games.groupby("date", sort=True).indices
     for date in sorted(groups):
@@ -65,7 +66,7 @@ def compute_elo(games: pd.DataFrame, config: EloConfig = EloConfig()):
         for i in idx:
             if not played[i]:
                 continue
-            diff = home_pre[i] + config.home_advantage - away_pre[i]
+            diff = home_pre[i] + hca[i] - away_pre[i]
             outcome = 1.0 if margin[i] > 0 else 0.0
             mult = 1.0
             if config.use_margin:
@@ -75,5 +76,5 @@ def compute_elo(games: pd.DataFrame, config: EloConfig = EloConfig()):
             ratings[away[i]] -= delta
 
     out = pd.DataFrame({"home_elo_pre": home_pre, "away_elo_pre": away_pre}, index=games.index)
-    out["elo_home_prob"] = expected_score(home_pre + config.home_advantage - away_pre)
+    out["elo_home_prob"] = expected_score(home_pre + hca - away_pre)
     return out, ratings

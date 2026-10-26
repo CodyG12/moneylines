@@ -7,6 +7,7 @@ Optional columns:
   home_odds, away_odds         decimal moneyline odds
   home_moneyline, away_moneyline  American odds (used if decimal absent)
   odds_timestamp               when the quoted odds were observed (ISO 8601)
+  neutral_site                 1/true for games with no real home team (default false)
 
 Rows with both scores blank are treated as scheduled (unplayed) games.
 """
@@ -101,6 +102,11 @@ def prepare_games(raw: pd.DataFrame) -> tuple[pd.DataFrame, DataReport]:
     if appearances.duplicated().any():
         dup = appearances[appearances.duplicated()].head(3).values.tolist()
         raise DataError(f"a team is listed in two games on the same date, e.g. {dup}")
+
+    if "neutral_site" in df.columns:
+        df["neutral_site"] = df["neutral_site"].fillna(False).astype(str).str.lower().isin(["1", "1.0", "true"])
+    else:
+        df["neutral_site"] = False
 
     if "season" in df.columns and df["season"].notna().all():
         df["season"] = df["season"].astype(int)

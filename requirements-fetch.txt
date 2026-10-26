@@ -1,2 +1,2 @@
-# Optional: only needed for scripts/fetch_nba_api.py (recent nba_api releases need Python 3.10+)
+# Optional: only needed for scripts/fetch_nba_api.py
 nba_api

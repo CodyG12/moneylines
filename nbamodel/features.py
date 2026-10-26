@@ -19,6 +19,7 @@ FEATURES = [
     "rest_diff",
     "home_b2b",
     "away_b2b",
+    "neutral_site_flag",
 ]
 
 REST_CAP = 7  # days; also used for a team's first game of a season
@@ -96,4 +97,5 @@ def build_features(games: pd.DataFrame, elo_config: EloConfig = EloConfig(), win
     out["rest_diff"] = out["home_days_rest"] - out["away_days_rest"]
     out["home_b2b"] = (out["home_days_rest"] == 1).astype(float)
     out["away_b2b"] = (out["away_days_rest"] == 1).astype(float)
+    out["neutral_site_flag"] = out["neutral_site"].astype(float)
     return out

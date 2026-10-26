@@ -45,3 +45,13 @@ def test_upsets_move_ratings_more():
     _, r2 = compute_elo(tiny(upset), EloConfig(use_margin=False))
     # home team is favoured (home advantage), so losing costs more than winning gains
     assert 1500 - r2["A"] > r1["A"] - 1500
+
+
+def test_neutral_site_removes_home_advantage():
+    import pandas as pd
+    from nbamodel.data import prepare_games
+    raw = pd.DataFrame({"date": ["2024-11-02", "2024-11-02"], "home_team": ["A", "C"], "away_team": ["B", "D"],
+                        "home_score": [None, None], "away_score": [None, None], "neutral_site": [1, 0]})
+    elo, _ = compute_elo(prepare_games(raw)[0])
+    assert elo.loc[0, "elo_home_prob"] == pytest.approx(0.5)
+    assert elo.loc[1, "elo_home_prob"] > 0.6

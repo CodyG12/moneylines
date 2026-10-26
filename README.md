@@ -46,11 +46,20 @@ python nba_model.py --games data/sample/synthetic_games.csv --output out/predict
 ## Run on real NBA data
 
 ```bash
-pip install -r requirements-fetch.txt        # nba_api; recent versions need Python 3.10+
-python scripts/fetch_nba_api.py --seasons 2018-19 2019-20 2020-21 2021-22 2022-23 2023-24 \
+pip install -r requirements-fetch.txt        # nba_api (1.10.2 verified on Python 3.9)
+python scripts/fetch_nba_api.py --seasons 2014-15 2015-16 2016-17 2017-18 2018-19 2019-20 2020-21 \
+    2021-22 2022-23 2023-24 2024-25 2025-26 2026-27 \
     --out data/raw/nba_games.csv
 python nba_model.py --games data/raw/nba_games.csv --output out/predictions.csv
 ```
+
+The fetch pulls regular-season games only; playoffs and the NBA Cup final (which doesn't count in
+regular-season stats) are excluded. It writes an explicit `season` column, so the 2019-20 bubble and
+the late 2020-21 start are labeled correctly. Neutral-site games are flagged `neutral_site=1` and get no
+home-court advantage. **Caveat:** the API marks them this way (both rows as `@`) only from 2024-25 on.
+Earlier neutral games, such as London, Mexico City and the 2023 Cup semifinals, come back as ordinary
+home/away games and aren't flagged. `nba_api` returns completed games only, so `predictions_upcoming.csv`
+is empty unless you add scheduled games to the CSV yourself.
 
 Or supply your own CSV in the format below. Use several full seasons. The
 code refuses to run on fewer than 100 played games across 30 dates, but that
@@ -67,6 +76,7 @@ evaluation.
 | `season` | recommended | season start year (2023 = 2023-24). Inferred from the month if absent, which mislabels the 2020 bubble/late start |
 | `home_odds`, `away_odds` | optional | decimal moneylines from the **same** book/snapshot |
 | `home_moneyline`, `away_moneyline` | optional | American odds, used if decimal is absent |
+| `neutral_site` | optional | 1/true when neither team is truly at home (default 0) |
 | `odds_timestamp` | optional | ISO time the quote was observed. Odds stamped after the game date are dropped. Without timestamps the run warns that the results are not executable-price backtests |
 
 Lines starting with `#` are comments.
