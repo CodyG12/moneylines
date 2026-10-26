@@ -10,6 +10,9 @@ Optional columns:
   neutral_site                 1/true for games with no real home team (default false)
   tipoff_utc                   scheduled tip-off (ISO 8601); enables the strict
                                odds-before-tip-off check
+  game_id_source               provider game id; becomes the stable `game_key`
+  home_fga, away_tov, ...      team box-score totals (see sources.BOX_STATS); used
+                               only for *earlier* games' efficiency features
 
 Rows with both scores blank are treated as scheduled (unplayed) games.
 """
@@ -22,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from .odds import american_to_decimal
+from .sources import BOX_STATS, normalize_game_id
 
 log = logging.getLogger(__name__)
 
@@ -116,10 +120,23 @@ def prepare_games(raw: pd.DataFrame) -> tuple[pd.DataFrame, DataReport]:
         df["season"] = infer_season(df["date"])
         report.season_inferred = True
 
+    for col in [f"{side}_{stat}" for side in ("home", "away") for stat in BOX_STATS]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").where(df["played"])
+
     _prepare_odds(df, report)
 
     df = df.sort_values(["date", "home_team"], kind="mergesort").reset_index(drop=True)
     df.insert(0, "game_id", np.arange(len(df)))
+    # Stable across file updates (game_id is positional): provider id when known.
+    fallback = df["date"].dt.strftime("%Y%m%d") + "-" + df["away_team"] + "-" + df["home_team"]
+    if "game_id_source" in df.columns:
+        src = df["game_id_source"]
+        df["game_key"] = np.where(src.notna(), normalize_game_id(src), fallback)
+    else:
+        df["game_key"] = fallback
+    if df["game_key"].duplicated().any():
+        raise DataError("duplicate game_id_source values")
 
     report.n_rows = len(df)
     report.n_played = int(df["played"].sum())
