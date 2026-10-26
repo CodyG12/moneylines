@@ -66,6 +66,45 @@ code refuses to run on fewer than 100 played games across 30 dates, but that
 is only a minimum for the code to work. It is far too little for meaningful
 evaluation.
 
+## Predict upcoming games
+
+```bash
+python scripts/update_schedule.py --games data/raw/nba_games.csv --season 2026-27
+python nba_model.py --games data/raw/nba_games.csv --output out/nba/predictions.csv --upcoming-days 3
+```
+
+`update_schedule.py` replaces the current season's rows with the NBA schedule. Finished games get their
+scores. Scheduled games get blank scores, UTC tip-off times and neutral-site flags. Preseason and the NBA
+Cup final are excluded. Rerun it daily so the latest results feed into Elo and form.
+
+**Early-season caution:** for the first few games of a season, "recent form" averages only 1 to 4
+games, and those predictions are flagged `[low history]`. On the validation period, games where either
+team had played fewer than 5 games scored worse (log loss 0.653, n=160) than the rest of the season
+(0.626, n=2,726). Treat early-season probabilities as less reliable. Shrinking form toward zero early in
+the season is planned for Phase 2.
+
+## Timestamped odds (The Odds API)
+
+1. Get a free key at [the-odds-api.com](https://the-odds-api.com). Then `cp .env.example .env` and put
+   the key in `.env`, which is git-ignored.
+2. Collect snapshots. Each run appends every book's current NBA moneylines, stamped with the time it was
+   observed:
+   ```bash
+   python scripts/collect_odds.py --out data/raw/odds_snapshots.csv
+   ```
+   On the free plan each run costs 1 credit (h2h market, `us` region). Run it a few times on game days,
+   for example by cron, to build your own timestamped archive. With a **paid** plan you can backfill
+   from June 2020 at 10 credits per snapshot:
+   `--historical --start 2024-10-22 --end 2025-04-13 --time 22:00`.
+3. Join the odds and run:
+   ```bash
+   python nba_model.py --games data/raw/nba_games.csv --odds data/raw/odds_snapshots.csv \
+       --book draftkings --odds-lead-minutes 60 --output out/nba/predictions.csv
+   ```
+   For each game, the run uses the latest quote observed at least `--odds-lead-minutes` before
+   tip-off. In-game quotes are never used. `--book best` takes the best price per side across all
+   books. That assumes you hold an account at every book, so it overstates realistic edges.
+
 ## Input format
 
 | column | required | notes |
@@ -76,6 +115,7 @@ evaluation.
 | `season` | recommended | season start year (2023 = 2023-24). Inferred from the month if absent, which mislabels the 2020 bubble/late start |
 | `home_odds`, `away_odds` | optional | decimal moneylines from the **same** book/snapshot |
 | `home_moneyline`, `away_moneyline` | optional | American odds, used if decimal is absent |
+| `tipoff_utc` | optional | scheduled tip-off; odds quoted at or after it are dropped |
 | `neutral_site` | optional | 1/true when neither team is truly at home (default 0) |
 | `odds_timestamp` | optional | ISO time the quote was observed. Odds stamped after the game date are dropped. Without timestamps the run warns that the results are not executable-price backtests |
 
@@ -120,7 +160,7 @@ Elo hyperparameters (K=20, HCA=100, carryover 0.75) are fixed defaults, not tune
 | source | what | cost / constraints |
 |---|---|---|
 | [`nba_api`](https://github.com/swar/nba_api) (stats.nba.com) | game results, box scores, team/player stats | Free. Unofficial wrapper of an undocumented site API. NBA.com terms limit use to personal, non-commercial purposes. Rate-limit your requests and don't redistribute the data. |
-| [The Odds API](https://the-odds-api.com) | current bookmaker moneylines | Free tier has a small monthly request quota. **Historical** odds need a paid plan. |
+| [The Odds API](https://the-odds-api.com) | timestamped bookmaker moneylines | Free plan: current odds at 1 credit per call, with a small monthly quota. **Historical** snapshots (from June 2020, 5 to 10 minute granularity) need a paid plan at 10 credits per call. Check their terms before redistributing data. |
 | Community CSV datasets (Kaggle, GitHub) | historical results, sometimes odds | Check each dataset's license. Odds archives often lack quote timestamps or mix opening and closing lines, so verify them before backtesting. |
 
 No scraping is implemented. Provider conversion lives in `nbamodel/sources.py`.
@@ -137,9 +177,11 @@ nbamodel/
   evaluation.py           log loss, Brier, clustered bootstrap, calibration
   odds.py                 odds conversion, vig removal, EV, Kelly
   backtest.py             paper-trading simulation
-  sources.py              provider format converters (nba_api)
+  sources.py              provider format converters (nba_api game logs and schedule)
+  odds_api.py             The Odds API client (current and historical)
+  odds_join.py            attach the latest pre-tip-off quote to each game
   sample.py               deterministic synthetic data generator
-scripts/                  sample-data generation, nba_api fetch
+scripts/                  sample data, nba_api fetch, schedule update, odds collection
 tests/                    pytest suite
 data/sample/              synthetic fixture
 ```
@@ -148,6 +190,6 @@ data/sample/              synthetic fixture
 
 - **Phase 2:** walk-forward (expanding window) validation per season, Elo hyperparameter search on validation, injury-adjusted strength, travel.
 - **Phase 3:** XGBoost/LightGBM, isotonic/sigmoid calibration fitted on a separate calibration split, Optuna, MLflow.
-- **Phase 4:** timestamped odds ingestion (The Odds API), a prediction log with closing-line value, PostgreSQL.
+- **Phase 4:** a prediction log with closing-line value, scheduled odds collection, PostgreSQL. Timestamped odds ingestion is done.
 - **Phase 5:** FastAPI and a Next.js dashboard, plus a paper-trading ledger.
 - **Phase 6:** drift monitoring and champion/challenger retraining on untouched holdouts.

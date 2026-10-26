@@ -60,7 +60,20 @@ def test_american_odds_converted_and_untimed_odds_flagged():
 
 def test_odds_observed_after_game_are_dropped():
     raw = pd.DataFrame({**BASE, "home_odds": [1.5, 2.0], "away_odds": [2.6, 1.9],
-                        "odds_timestamp": ["2023-10-24T12:00:00Z", "2023-10-25T02:00:00Z"]})
+                        "odds_timestamp": ["2023-10-24T12:00:00Z", "2023-10-25T18:00:00Z"]})
     games, report = prepare_games(raw)
     assert games["home_odds"].notna().tolist() == [True, False]
     assert report.n_odds_after_game_dropped == 1
+
+
+def test_odds_check_uses_eastern_date_and_tipoff():
+    raw = pd.DataFrame({
+        **BASE, "home_odds": [1.5, 2.0], "away_odds": [2.6, 1.9],
+        # 01:00Z on the 25th is 9pm ET on the 24th: still the game date
+        "odds_timestamp": ["2023-10-25T01:00:00Z", "2023-10-24T23:10:00Z"],
+        "tipoff_utc": ["2023-10-25T02:00:00Z", "2023-10-24T23:00:00Z"]})
+    games, report = prepare_games(raw)
+    # first quote is an hour before tip-off; second came 10 minutes after tip-off
+    assert games["home_odds"].notna().tolist() == [True, False]
+    assert report.n_odds_after_game_dropped == 1
+    assert report.odds_timing_verified

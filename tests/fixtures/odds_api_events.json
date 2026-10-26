@@ -1,0 +1,19 @@
+[
+  {"id": "ev1", "sport_key": "basketball_nba", "commence_time": "2026-10-26T23:00:00Z",
+   "home_team": "Charlotte Hornets", "away_team": "Washington Wizards",
+   "bookmakers": [
+     {"key": "draftkings", "title": "DraftKings", "markets": [
+       {"key": "h2h", "last_update": "2026-10-26T17:55:00Z",
+        "outcomes": [{"name": "Charlotte Hornets", "price": 1.60}, {"name": "Washington Wizards", "price": 2.40}]}]},
+     {"key": "fanduel", "title": "FanDuel", "markets": [
+       {"key": "h2h", "last_update": "2026-10-26T17:58:00Z",
+        "outcomes": [{"name": "Washington Wizards", "price": 2.50}, {"name": "Charlotte Hornets", "price": 1.57}]}]}
+   ]},
+  {"id": "ev2", "sport_key": "basketball_nba", "commence_time": "2026-10-27T02:00:00Z",
+   "home_team": "Denver Nuggets", "away_team": "Golden State Warriors",
+   "bookmakers": [{"key": "draftkings", "title": "DraftKings", "markets": [
+     {"key": "h2h", "last_update": "2026-10-26T17:50:00Z",
+      "outcomes": [{"name": "Denver Nuggets", "price": 1.45}, {"name": "Golden State Warriors", "price": 2.85}]}]}]},
+  {"id": "ev3", "sport_key": "basketball_nba", "commence_time": "2026-10-27T02:00:00Z",
+   "home_team": "Team Unknown", "away_team": "Golden State Warriors", "bookmakers": []}
+]

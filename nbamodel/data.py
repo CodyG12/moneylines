@@ -8,6 +8,8 @@ Optional columns:
   home_moneyline, away_moneyline  American odds (used if decimal absent)
   odds_timestamp               when the quoted odds were observed (ISO 8601)
   neutral_site                 1/true for games with no real home team (default false)
+  tipoff_utc                   scheduled tip-off (ISO 8601); enables the strict
+                               odds-before-tip-off check
 
 Rows with both scores blank are treated as scheduled (unplayed) games.
 """
@@ -156,16 +158,21 @@ def _prepare_odds(df: pd.DataFrame, report: DataReport) -> None:
     df.loc[incomplete, ["home_odds", "away_odds"]] = np.nan
     report.n_odds_missing = int(incomplete.sum())
 
+    priced = df["home_odds"].notna()
     if "odds_timestamp" in df.columns:
         ts = pd.to_datetime(df["odds_timestamp"], errors="coerce", utc=True)
-        # Tip-off times are not in the data, so the strictest check available is
-        # that the quote was observed no later than the game's calendar date.
-        after = ts.notna() & (ts.dt.tz_convert(None).dt.normalize() > df["date"])
+        # Game dates are US Eastern calendar dates, so compare in that zone.
+        after = ts.notna() & (ts.dt.tz_convert("US/Eastern").dt.tz_localize(None).dt.normalize() > df["date"])
+        if "tipoff_utc" in df.columns:
+            # Strict check where the tip-off time is known: quote must precede tip-off.
+            tip = pd.to_datetime(df["tipoff_utc"], errors="coerce", utc=True)
+            after = after | (ts.notna() & tip.notna() & (ts >= tip))
+        after &= priced
         if after.any():
             report.n_odds_after_game_dropped = int(after.sum())
             df.loc[after, ["home_odds", "away_odds"]] = np.nan
-            report.warn(f"dropped odds for {int(after.sum())} games whose odds_timestamp is after game date")
-        report.odds_timing_verified = bool(ts.notna().all())
+            report.warn(f"dropped odds for {int(after.sum())} games quoted at or after tip-off / game date")
+        report.odds_timing_verified = bool(ts[priced].notna().all())
     if not report.odds_timing_verified:
         report.warn("odds have no (complete) odds_timestamp: quotes may be closing lines or later; "
                     "paper-trading results do not represent prices you could have actually bet")

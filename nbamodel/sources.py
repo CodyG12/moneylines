@@ -54,3 +54,33 @@ def team_logs_to_games(logs: pd.DataFrame) -> pd.DataFrame:
         "game_id_source": merged["GAME_ID"],
     })
     return games.sort_values(["date", "home_team"]).reset_index(drop=True)
+
+
+def schedule_to_games(schedule: pd.DataFrame) -> pd.DataFrame:
+    """Convert nba_api ScheduleLeagueV2 rows into canonical games rows.
+
+    Keeps regular-season games only (gameId prefix "002"): preseason ("001") and
+    the NBA Cup final ("006", not counted in standings) are dropped, as are games
+    whose teams are not yet known. Final games keep their scores; everything
+    else (scheduled, live, postponed) gets blank scores.
+    """
+    needed = {"gameId", "gameDateEst", "gameDateTimeUTC", "gameStatus", "isNeutral", "seasonYear",
+              "homeTeam_teamTricode", "awayTeam_teamTricode", "homeTeam_score", "awayTeam_score"}
+    missing = needed - set(schedule.columns)
+    if missing:
+        raise ValueError(f"schedule missing columns: {sorted(missing)}")
+    df = schedule[schedule["gameId"].astype(str).str.startswith("002")
+                  & schedule["homeTeam_teamTricode"].notna() & schedule["awayTeam_teamTricode"].notna()].copy()
+    final = df["gameStatus"].astype(int) == 3
+    games = pd.DataFrame({
+        "date": df["gameDateEst"].str[:10],
+        "season": df["seasonYear"].astype(str).str[:4].astype(int),
+        "home_team": df["homeTeam_teamTricode"],
+        "away_team": df["awayTeam_teamTricode"],
+        "home_score": df["homeTeam_score"].where(final).astype("Int64"),
+        "away_score": df["awayTeam_score"].where(final).astype("Int64"),
+        "neutral_site": df["isNeutral"].astype(str).str.lower().isin(["true", "1"]).astype(int),
+        "tipoff_utc": df["gameDateTimeUTC"],
+        "game_id_source": df["gameId"],
+    })
+    return games.sort_values(["date", "home_team"]).reset_index(drop=True)

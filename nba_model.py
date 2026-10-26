@@ -13,8 +13,11 @@ import sys
 from pathlib import Path
 
 from nbamodel.backtest import BettingConfig
-from nbamodel.data import DataError, load_games
+import pandas as pd
+
+from nbamodel.data import DataError, prepare_games
 from nbamodel.elo import EloConfig
+from nbamodel.odds_join import attach_odds
 from nbamodel.pipeline import PipelineConfig, run_pipeline
 
 log = logging.getLogger("nba_model")
@@ -32,6 +35,12 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--games", required=True, help="CSV of historical (and optionally scheduled) games")
     p.add_argument("--output", default="predictions.csv", help="holdout predictions CSV")
+    p.add_argument("--odds", help="odds snapshot CSV from scripts/collect_odds.py (replaces odds in --games)")
+    p.add_argument("--book", default="draftkings", help='bookmaker key, or "best" (optimistic line shopping)')
+    p.add_argument("--odds-lead-minutes", type=float, default=60.0,
+                   help="use the latest quote observed at least this long before tip-off")
+    p.add_argument("--upcoming-days", type=int, default=7,
+                   help="predict scheduled games within this many days of the next game date")
     p.add_argument("--window", type=int, default=10, help="recent-form window in games")
     p.add_argument("--elo-k", type=float, default=20.0)
     p.add_argument("--elo-home-advantage", type=float, default=100.0)
@@ -84,6 +93,21 @@ def print_summary(metrics: dict) -> None:
         print(f"\nWARNING: {w}")
 
 
+def print_upcoming(upcoming) -> None:
+    if upcoming.empty:
+        return
+    print(f"\nUpcoming games ({len(upcoming)}): model home win probability and fair odds")
+    for _, r in upcoming.iterrows():
+        line = (f"  {r['date'].date()} {r['away_team']:>3} @ {r['home_team']:<3} "
+                f"p(home)={r['model_home_prob']:.3f}  fair {r['fair_home_american']:+d}/{r['fair_away_american']:+d}")
+        if r["home_odds"] == r["home_odds"]:
+            line += (f"  market {r['home_odds']:.2f}/{r['away_odds']:.2f} "
+                     f"no-vig p(home)={r['market_home_prob_novig']:.3f}")
+        if r["low_history"]:
+            line += "  [low history]"
+        print(line)
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
@@ -92,10 +116,20 @@ def main(argv=None) -> int:
         elo=EloConfig(k=args.elo_k, home_advantage=args.elo_home_advantage, season_carryover=args.elo_carryover),
         betting=BettingConfig(ev_threshold=args.ev_threshold, kelly_multiplier=args.kelly_multiplier),
         window=args.window, train_frac=args.train_frac, validation_frac=args.validation_frac,
-        n_boot=args.n_boot, seed=args.seed,
+        n_boot=args.n_boot, seed=args.seed, upcoming_days=args.upcoming_days,
     )
     try:
-        games, report = load_games(args.games)
+        try:
+            raw = pd.read_csv(args.games, comment="#")
+        except FileNotFoundError as exc:
+            raise DataError(f"games file not found: {args.games}") from exc
+        if args.odds:
+            try:
+                snapshots = pd.read_csv(args.odds)
+            except FileNotFoundError as exc:
+                raise DataError(f"odds file not found: {args.odds}") from exc
+            raw = attach_odds(raw, snapshots, book=args.book, lead_minutes=args.odds_lead_minutes)
+        games, report = prepare_games(raw)
         result = run_pipeline(games, report, config)
     except DataError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -113,11 +147,14 @@ def main(argv=None) -> int:
         result.bets.to_csv(f"{stem}_paper_bets.csv", index=False, float_format="%.6f")
         written.append(f"{stem}_paper_bets.csv")
     if not result.upcoming.empty:
-        cols = [c for c in PREDICTION_COLUMNS if c not in ("home_score", "away_score", "home_win")] + ["low_history"]
+        cols = [c for c in PREDICTION_COLUMNS if c not in ("home_score", "away_score", "home_win")]
+        cols += [c for c in ("tipoff_utc", "odds_timestamp", "odds_book") if c in result.upcoming.columns]
+        cols += ["low_history"]
         result.upcoming[cols].to_csv(f"{stem}_upcoming.csv", index=False, float_format="%.6f")
         written.append(f"{stem}_upcoming.csv")
 
     print_summary(result.metrics)
+    print_upcoming(result.upcoming)
     print("\nWrote: " + ", ".join(written))
     return 0
 

@@ -42,6 +42,7 @@ class PipelineConfig:
     min_history: int = 5          # training rows need both teams to have >= this many prior games
     n_boot: int = 1000
     seed: int = 0
+    upcoming_days: int = 7
 
 
 @dataclass
@@ -176,6 +177,9 @@ def run_pipeline(games: pd.DataFrame, report: DataReport, config: PipelineConfig
         metrics["paper_trading"] = sim
 
     upcoming = feats[~feats["played"] & (feats["date"] > played["date"].max())].copy()
+    if not upcoming.empty:
+        horizon = upcoming["date"].min() + pd.Timedelta(days=config.upcoming_days - 1)
+        upcoming = upcoming[upcoming["date"] <= horizon].copy()
     if not upcoming.empty:
         # Refit on every played game (with enough history) for live use; this model
         # has no out-of-sample score of its own beyond the holdout result above.
