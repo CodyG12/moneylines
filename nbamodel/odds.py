@@ -95,3 +95,58 @@ def kelly_fraction(prob, decimal):
     _check_prob(p)
     _check_decimal(d)
     return np.clip((p * d - 1.0) / (d - 1.0), 0.0, None)
+
+
+def american_implied_probability(american):
+    """Raw implied probability of an American price (includes the margin)."""
+    return implied_probability(american_to_decimal(american))
+
+
+def margin_from_american(home_american, away_american):
+    """Sportsbook margin (overround) of a two-way market quoted in American odds."""
+    return overround(american_to_decimal(home_american), american_to_decimal(away_american))
+
+
+def probability_edge(model_prob, market_prob_novig):
+    """Model minus market (no-vig) probability for the same side. Positive does not mean profitable:
+    the bettor still has to beat the price *including* the margin (see expected_value)."""
+    return _arr(model_prob) - _arr(market_prob_novig)
+
+
+def expected_roi(prob, decimal):
+    """Expected return per unit staked under `prob`; identical to expected_value, named for reports."""
+    return expected_value(prob, decimal)
+
+
+def closing_line_value(bet_decimal, close_decimal_side, close_decimal_other):
+    """CLV of a bet: how much better the taken price was than the no-vig closing price.
+
+    Returns bet_decimal / fair_close_decimal - 1, where fair_close_decimal = 1 / no-vig closing
+    probability of the bet's side. Positive CLV means the bet beat the closing market.
+    """
+    p_close, _ = remove_vig_two_way(close_decimal_side, close_decimal_other)
+    return _arr(bet_decimal) * p_close - 1.0
+
+
+def fair_odds_quote(home_prob, home_decimal=None, away_decimal=None) -> dict:
+    """Fair model prices for one game and, when given, a comparison with a book's offered prices.
+
+    "fair_*" fields are the model's zero-margin prices; "book_*" fields are what was offered.
+    """
+    p = float(home_prob)
+    q = {"model_home_prob": p, "model_away_prob": 1 - p,
+         "fair_home_decimal": float(fair_decimal_odds(p)), "fair_away_decimal": float(fair_decimal_odds(1 - p)),
+         "fair_home_american": int(round(float(fair_american_odds(p)))),
+         "fair_away_american": int(round(float(fair_american_odds(1 - p))))}
+    if home_decimal is not None and away_decimal is not None:
+        h, a = float(home_decimal), float(away_decimal)
+        nv_h, nv_a = remove_vig_two_way(h, a)
+        q.update({"book_home_decimal": h, "book_away_decimal": a,
+                  "book_home_american": int(round(float(decimal_to_american(h)))),
+                  "book_away_american": int(round(float(decimal_to_american(a)))),
+                  "book_margin": float(overround(h, a)),
+                  "break_even_home": float(break_even_probability(h)), "break_even_away": float(break_even_probability(a)),
+                  "market_home_prob_novig": float(nv_h), "market_away_prob_novig": float(nv_a),
+                  "edge_home": float(probability_edge(p, nv_h)), "edge_away": float(probability_edge(1 - p, nv_a)),
+                  "ev_home": float(expected_value(p, h)), "ev_away": float(expected_value(1 - p, a))})
+    return q

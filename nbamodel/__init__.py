@@ -1,3 +1,3 @@
-"""NBA moneyline probability model, Phase 1 (research / paper trading only)."""
+"""NBA moneyline probability model (research / paper trading only)."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -1,4 +1,8 @@
-# NBA Moneyline Model: Phase 1
+# NBA Moneyline Model
+
+> **Phase 2** (walk-forward backtesting, three model families, calibration, prediction log, dashboard) is
+> documented in [Phase 2](#phase-2-walk-forward-models-and-feedback) below. The Phase 1 pipeline
+> (`nba_model.py`) is unchanged and still works.
 
 A research and **paper-trading** system that estimates NBA home-team win
 probabilities, converts them to fair moneyline odds, and evaluates them on
@@ -25,7 +29,7 @@ with archived, timestamped prices, and it hasn't done so yet.
 Requires Python 3.9+.
 
 ```bash
-python3 -m venv .venv
+python3 -m venv .venv          # if the repo was moved/renamed, recreate the venv: activate hard-codes its path
 source .venv/bin/activate
 pip install -r requirements.txt
 pytest -q
@@ -165,6 +169,165 @@ Elo hyperparameters (K=20, HCA=100, carryover 0.75) are fixed defaults, not tune
 
 No scraping is implemented. Provider conversion lives in `nbamodel/sources.py`.
 
+## Phase 2: walk-forward models and feedback
+
+All commands read `config/phase2.json`; override with `--config` or per-command flags.
+`make <target>` wraps each of them (see `Makefile`).
+
+| step | command |
+|---|---|
+| fetch history (box scores + tip-off times) | `make data-fetch` |
+| refresh current season | `make data-update` (`scripts/update_schedule.py`) |
+| build the training dataset | `python -m nbamodel build-dataset` |
+| development walk-forward + champion choice | `python -m nbamodel walk-forward [--retrain weekly\|monthly\|season] [--window expanding\|rolling] [--calibration none\|platt\|isotonic]` |
+| evaluate calibrated probabilities / any predictions file | in the walk-forward report; or `python -m nbamodel evaluate --predictions FILE --out DIR` |
+| final holdout test (**once**) | `python -m nbamodel final-test` |
+| train + version the production model | `python -m nbamodel train [--model ...]` |
+| predict upcoming games | `python -m nbamodel predict [--days 3] [--odds data/raw/odds_snapshots.csv]` |
+| record results, update metrics/Elo, check drift | `python -m nbamodel update-results [--retrain-if-due]` |
+| dashboard | `python -m nbamodel dashboard` -> `out/dashboard/index.html` |
+| tests | `make test` |
+
+Game day: `make daily` (refresh data, reconcile and retrain if due, predict, rebuild dashboard).
+
+### Data
+
+`scripts/fetch_nba_api.py` now keeps team box-score totals (FGA, FGM, 3PM, FTA, OREB, DREB, TOV)
+for possession estimates, adds tip-off times and neutral flags from the schedule endpoint where it
+exists, and stamps `fetched_at`. `update_schedule.py` also fills in box scores for completed
+current-season games. On the current file: 14,482 played regular-season games (2014-15 to 43 games
+into 2026-27), all with box scores; tip-off times exist from 2017-18 onward (older rows use a nominal
+09:00 ET prediction time). Each game gets a stable `game_key` (the NBA game id).
+
+### Dataset and features (`nbamodel/dataset.py`, `nbamodel/features.py`)
+
+Each row is one game as known at its `prediction_timestamp` (tip-off minus 60 minutes, or 09:00 ET).
+Rows record `features_asof` (results through the previous ET date), each team's previous game date,
+`source_fetched_at` and `train_eligible`. Final scores and box scores are kept only as labels, and
+`validate_dataset` rejects any row whose inputs could post-date the game. `FEATURES_V2` contains:
+
+- **Strength:** Elo difference, opponent- and venue-adjusted margin, wins over Elo expectation
+  (opponent-adjusted win %), strength of schedule, home-games margin vs road-games margin
+- **Recent form:** last-5 and last-10 margin, last-10 win %, exponentially weighted margin (half-life
+  7 games), last-10 net rating
+- **Efficiency:** offensive and defensive ratings per 100 possessions, season to date, as
+  "home offence + away defence" and the reverse, relative to the league average
+- **Schedule:** rest difference, back-to-backs, consecutive home or road games
+- **Matchup:** head-to-head residual vs Elo over this season and last, shrunk with a 4-game prior;
+  games played (early-season flag)
+
+Every season-level and rolling stat is shrunk toward a neutral prior, which addresses the Phase 1
+early-season caveat. Games are processed a date at a time, so same-night games never see each
+other's results.
+
+**Not included: injuries and lineups.** There is no reliable, timestamped historical source wired in.
+`nbamodel/availability.py` is an adapter for one. It requires a report timestamp on every row and
+uses only reports published before the prediction time.
+
+**Leakage checks** (`nbamodel/leakage.py`, run by `build-dataset` and `walk-forward`, and tested): flip
+every result on or after a cutoff and require features on the cutoff date to be unchanged, then
+screen for features almost perfectly correlated with the label. Tests confirm the checks catch a
+deliberately leaky "final margin" feature and an off-by-one rolling window.
+
+### Models (`nbamodel/models.py`)
+
+| | model | tuning, always inside the training window |
+|---|---|---|
+| A | Elo (`elo.py`) | K, home advantage and season carryover grid, chosen on the window's own one-step-ahead log loss |
+| B | logistic regression (median impute + standardize + L2) | C on the last 20% of fit-window dates |
+| C | gradient boosting (scikit-learn `HistGradientBoostingClassifier`, monotone in Elo / adjusted margin / efficiency matchups; `gbm_backend: "lightgbm"` optional) | 3-config grid, same inner split |
+| D | ensemble (logit-mean of B and C, no fitted weights) | eligible as champion only if it beats both components |
+
+Calibration (Platt or isotonic) is fitted on the 40 most recent training dates, which are held out
+from model fitting. Calibrated and uncalibrated variants are both scored. Seeds are fixed. The
+walk-forward picks the champion by development log loss. `train` refits it on all eligible games
+and saves `artifacts/models/<version>/{model.joblib,metadata.json}`. The metadata records the
+features with definitions, hyperparameters, training range, data hash, git commit and reference
+walk-forward metrics. `active.json` points to the live version.
+
+### Walk-forward (`nbamodel/walkforward.py`)
+
+Monthly (or weekly, or per-season) periods, expanding (or rolling) window. Each period trains only
+on games before it, fits preprocessing and hyperparameters on the fit window, fits the calibrator
+on the later calibration window, and predicts from inputs with outcome columns removed. Outcomes
+are joined only after all predictions are frozen. Development covers 2016-17 to 2024-25 (the first
+two seasons are training only). The **final test** (from 2025-10-01) is evaluated by `final-test`
+with the configuration fixed in advance. Each run is logged to `artifacts/final_test_log.jsonl` and
+warns if the holdout has been used before.
+
+### Results on real data (generated 2026-10-26)
+
+Development walk-forward: 10,749 games, monthly retraining, 71 periods. 95% CIs resample whole dates.
+
+| model | log loss [95% CI] | Brier | accuracy | AUC | ECE | cal. slope |
+|---|---|---|---|---|---|---|
+| **Logistic, uncalibrated (champion)** | **0.6237** [0.6171, 0.6312] | 0.2171 | 0.651 | 0.698 | 0.012 | 0.92 |
+| Logistic, Platt-calibrated | 0.6264 [0.6198, 0.6334] | 0.2180 | 0.650 | 0.696 | 0.010 | 0.94 |
+| Elo (tuned in-window) | 0.6265 [0.6197, 0.6337] | 0.2185 | 0.647 | 0.695 | 0.024 | 0.93 |
+| Ensemble | 0.6267 [0.6202, 0.6335] | 0.2183 | 0.648 | 0.695 | 0.010 | 0.96 |
+| Boosting, uncalibrated | 0.6284 [0.6213, 0.6361] | 0.2190 | 0.651 | 0.693 | 0.020 | 0.87 |
+| Home-win base rate | 0.6854 [0.6827, 0.6882] | 0.2462 | 0.563 | 0.510 | 0.014 | n/a |
+
+The champion's paired log-loss edge over Elo is -0.0028 [-0.0046, -0.0009]: real, but small. It is
+worse than Elo in the first 5 games of a season (0.659 vs 0.653, n=711) and when training history
+is short (2016-17). Platt calibration did not help, because the models were already well calibrated.
+
+**Final holdout** (2025-26 plus 2026-27 through 10-25; 1,273 games; run once with the champion fixed
+in advance):
+
+| model | log loss [95% CI] | Brier | accuracy | AUC |
+|---|---|---|---|---|
+| **Logistic, uncalibrated (champion)** | **0.5964** [0.5733, 0.6184] | 0.2047 | 0.689 | 0.740 |
+| Boosting, uncalibrated | 0.5972 [0.5748, 0.6199] | 0.2048 | 0.694 | 0.741 |
+| Elo | 0.5986 [0.5754, 0.6205] | 0.2057 | 0.687 | 0.740 |
+| Home-win base rate | 0.6883 [0.6810, 0.6952] | 0.2476 | 0.551 | 0.512 |
+
+On the holdout, champion minus Elo is -0.0022 [-0.0077, +0.0033]: the same direction as development,
+but not significant on one season. **No market comparison or profitability claim is possible yet:**
+there is no archived, timestamped odds history. Paper trading refuses untimestamped or late prices
+and reports `no_valid_odds`.
+
+### Fair odds and paper trading
+
+`odds.fair_odds_quote(p, home_decimal, away_decimal)` returns fair (zero-margin) model prices, the
+book's prices, margin, break-even and no-vig probabilities, edge and EV, each labeled. For example,
+p = 0.60 gives a fair line of -150/+150. Against a -130/+110 book it shows a 4.1% margin, a 54.3% no-vig market price and a
++6.2% EV estimate, which is an estimate and not a promise. `backtest.paper_trade` classifies every
+game (`bet`, `below_threshold`, `no_odds`, `no_odds_timestamp`, `odds_after_decision`). It runs
+flat-stake and capped fractional-Kelly simulations with per-day exposure caps, ROI CIs, drawdown and
+CLV (from `odds_join.attach_odds_with_close`), plus a threshold sweep with a Bonferroni-widened
+interval as an overfitting check.
+
+### Prediction log and feedback (`nbamodel/store.py`, SQLite at `data/predictions.db` or `$MONEYLINES_DB`)
+
+`predict` appends each prediction with its timestamp, model version, feature snapshot, both
+probabilities, fair odds, market odds where available, model spread and key factors. Rows are never
+updated. `update-results` matches final results and scores each prediction, excluding any made at or
+after tip-off. It then snapshots metrics (all games, last 100, last 300) and team Elo, and flags
+degradation when recent log loss exceeds the walk-forward reference by more than 2 standard errors
+(at least 100 games). Retraining happens only on the configured cadence (7 days, when new results
+exist) or on degradation, and always as a full refit with the validated configuration. Single
+results never adjust weights.
+
+### Dashboard
+
+`out/dashboard/index.html` is a self-contained page (light and dark) with: model overview, upcoming
+games with fair lines and data freshness, the live prediction log, walk-forward and final-test
+comparisons with calibration and season charts, paper trading (labeled SIMULATED), feature
+importance, metrics history, alerts, retraining history and the model registry.
+
+### Known limitations
+
+- No timestamped historical odds, so no market benchmark and no valid profitability backtest. Start
+  `scripts/collect_odds.py` on a schedule now. A paid Odds API plan can backfill from June 2020.
+- No injury or lineup data. This is likely the largest missing signal, especially near the market.
+- Neutral-site games before 2024-25 are still unflagged. The schedule endpoint doesn't mark them either.
+- Pre-2017 rows have no tip-off time, so they use a nominal 09:00 ET prediction time.
+- Uncertainty for a single game is shown as model disagreement (spread), not a calibrated interval.
+- Elo features use the default config. Only the Elo *baseline* is tuned per window.
+- Logistic coefficients on correlated strength features (e.g. Elo vs adjusted margin) are not
+  individually interpretable.
+
 ## Layout
 
 ```
@@ -181,6 +344,19 @@ nbamodel/
   odds_api.py             The Odds API client (current and historical)
   odds_join.py            attach the latest pre-tip-off quote to each game
   sample.py               deterministic synthetic data generator
+  dataset.py              Phase 2 training dataset with timestamps and timing validation
+  leakage.py              perturbation / label-correlation look-ahead checks
+  models.py               Elo, logistic, gradient boosting, calibrators, ensemble
+  walkforward.py          chronological walk-forward backtest
+  report.py, plots.py     metrics, champion choice, charts
+  production.py           production training and upcoming predictions
+  registry.py             versioned model artifacts
+  store.py                SQLite prediction log, result reconciliation, drift, retraining triggers
+  availability.py         timestamped injury-report adapter (not in default features)
+  dashboard.py            static HTML dashboard
+  cli.py, __main__.py     `python -m nbamodel ...`
+config/phase2.json        Phase 2 settings
+Makefile                  reproducible commands
 scripts/                  sample data, nba_api fetch, schedule update, odds collection
 tests/                    pytest suite
 data/sample/              synthetic fixture
@@ -188,8 +364,9 @@ data/sample/              synthetic fixture
 
 ## Roadmap
 
-- **Phase 2:** walk-forward (expanding window) validation per season, Elo hyperparameter search on validation, injury-adjusted strength, travel.
-- **Phase 3:** XGBoost/LightGBM, isotonic/sigmoid calibration fitted on a separate calibration split, Optuna, MLflow.
-- **Phase 4:** a prediction log with closing-line value, scheduled odds collection, PostgreSQL. Timestamped odds ingestion is done.
-- **Phase 5:** FastAPI and a Next.js dashboard, plus a paper-trading ledger.
-- **Phase 6:** drift monitoring and champion/challenger retraining on untouched holdouts.
+- **Done in Phase 2:** walk-forward validation, in-window Elo tuning, boosting, calibration,
+  prediction log, drift checks, dashboard.
+- **Next:** archive timestamped odds daily, then a market benchmark, CLV and a valid paper-trading backtest.
+- Timestamped injury-report ingestion, through `availability.py`.
+- Travel / time-zone features; a better early-season model (blend toward Elo when few games are played).
+- FastAPI + interactive frontend; PostgreSQL if the SQLite log outgrows a single machine.

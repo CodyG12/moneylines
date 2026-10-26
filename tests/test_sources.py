@@ -49,3 +49,24 @@ def test_schedule_to_games():
     assert games["neutral_site"].tolist() == [0, 0, 1]
     parsed, report = prepare_games(games)
     assert report.n_played == 1 and report.n_scheduled == 2
+
+
+def test_box_scores_kept_and_schedule_merged():
+    from nbamodel.sources import merge_box_scores, merge_schedule_info
+    logs = pd.DataFrame({
+        "SEASON_ID": ["22023"] * 2, "GAME_ID": ["0022300001"] * 2, "GAME_DATE": ["2023-10-24"] * 2,
+        "TEAM_ABBREVIATION": ["DEN", "LAL"], "MATCHUP": ["DEN vs. LAL", "LAL @ DEN"], "PTS": [119, 107],
+        "FGA": [91, 85], "FTA": [20, 17], "OREB": [11, 9], "TOV": [12, 15], "FGM": [48, 41], "FG3M": [8, 10],
+        "DREB": [36, 33]})
+    games = team_logs_to_games(logs)
+    assert games.loc[0, ["home_fga", "away_fga", "home_tov", "away_tov"]].tolist() == [91, 85, 12, 15]
+    games["game_id_source"] = games["game_id_source"].str.lstrip("0")   # as after a CSV round trip
+    sched = pd.DataFrame({"game_id_source": ["0022300001"], "tipoff_utc": ["2023-10-24T23:30:00Z"],
+                          "neutral_site": [1]})
+    merged = merge_schedule_info(games, sched)
+    assert merged.loc[0, "tipoff_utc"] == "2023-10-24T23:30:00Z" and merged.loc[0, "neutral_site"] == 1
+    assert merged.loc[0, "game_id_source"] == "0022300001"
+    bare = merged.drop(columns=[c for c in merged.columns if c.endswith("_fga")])
+    assert merge_box_scores(bare, team_logs_to_games(logs)).loc[0, "home_fga"] == 91
+    parsed = prepare_games(merged)[0]
+    assert parsed.loc[0, "game_key"] == "0022300001" and parsed.loc[0, "home_fga"] == 91

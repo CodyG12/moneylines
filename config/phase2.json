@@ -1,0 +1,49 @@
+{
+  "paths": {
+    "games": "data/raw/nba_games.csv",
+    "odds": null,
+    "book": "draftkings",
+    "db": "data/predictions.db",
+    "artifacts": "artifacts/models",
+    "dataset": "data/processed/training_dataset.csv",
+    "walkforward_dir": "out/walkforward",
+    "final_test_dir": "out/final_test",
+    "final_test_log": "artifacts/final_test_log.jsonl",
+    "upcoming": "out/upcoming_predictions.csv",
+    "dashboard": "out/dashboard/index.html"
+  },
+  "dataset": {
+    "window": 10,
+    "lead_minutes": 60,
+    "min_history": 5,
+    "elo": {"k": 20.0, "home_advantage": 100.0, "initial_rating": 1500.0, "season_carryover": 0.75, "use_margin": true}
+  },
+  "walk_forward": {
+    "retrain": "monthly",
+    "window": "expanding",
+    "rolling_seasons": 4,
+    "min_train_seasons": 2,
+    "calibration_dates": 40,
+    "calibration": "platt",
+    "validation_frac": 0.2,
+    "gbm_backend": "sklearn",
+    "seed": 0,
+    "final_test_start": "2025-10-01"
+  },
+  "betting": {
+    "ev_threshold": 0.02,
+    "flat_stake": 1.0,
+    "kelly_multiplier": 0.25,
+    "max_bet_fraction": 0.02,
+    "max_daily_exposure": 0.10,
+    "initial_bankroll": 100.0
+  },
+  "feedback": {
+    "retrain_cadence_days": 7,
+    "degradation_min_n": 100,
+    "degradation_window": 300,
+    "degradation_z": 2.0
+  },
+  "predict": {"horizon_days": 3},
+  "evaluation": {"n_boot": 1000, "seed": 0}
+}

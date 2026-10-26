@@ -5,3 +5,6 @@ __pycache__/
 out/
 data/raw/
 .env
+artifacts/
+data/processed/
+data/*.db

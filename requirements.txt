@@ -1,4 +1,9 @@
 numpy>=1.23,<3
 pandas>=1.5,<3
 scikit-learn>=1.2,<2
+matplotlib>=3.5,<4
+joblib>=1.2
 pytest>=7
+# Optional: `pip install lightgbm` for walk_forward.gbm_backend = "lightgbm"
+# (macOS also needs `brew install libomp`). The default backend is scikit-learn's
+# HistGradientBoostingClassifier, which needs no native dependency.

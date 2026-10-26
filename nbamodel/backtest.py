@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .evaluation import cluster_bootstrap_ratio
-from .odds import expected_value, kelly_fraction
+from .odds import closing_line_value, expected_value, kelly_fraction, overround, remove_vig_two_way
 
 
 @dataclass(frozen=True)
@@ -107,3 +107,120 @@ def simulate(bets: pd.DataFrame, config: BettingConfig = BettingConfig(), n_boot
         },
     }
     return bets, summary
+
+
+# ------------------------------------------------------------------ Phase 2
+DECISIONS = ("bet", "below_threshold", "no_odds", "no_odds_timestamp", "odds_after_decision")
+SWEEP_THRESHOLDS = (0.0, 0.01, 0.02, 0.03, 0.05, 0.08)
+
+
+def decision_table(df: pd.DataFrame, p_col: str, threshold: float, require_timestamps: bool = True) -> pd.DataFrame:
+    """Classify every game: bet, or why not.
+
+    A price is usable only if it was observed at or before the game's decision time
+    (`prediction_timestamp`). Untimestamped prices are refused unless require_timestamps=False,
+    because they may be closing or post-game lines.
+    """
+    out = df.copy()
+    has_odds = out["home_odds"].notna() & out["away_odds"].notna() if "home_odds" in out else pd.Series(
+        False, index=out.index)
+    ts = (pd.to_datetime(out["odds_timestamp"], utc=True, errors="coerce") if "odds_timestamp" in out
+          else pd.Series(pd.NaT, index=out.index, dtype="datetime64[ns, UTC]"))
+    decision_at = pd.to_datetime(out["prediction_timestamp"], utc=True, errors="coerce")
+    reason = pd.Series("bet", index=out.index, dtype=object)
+    reason[~has_odds] = "no_odds"
+    if require_timestamps:
+        reason[has_odds & ts.isna()] = "no_odds_timestamp"
+    reason[has_odds & ts.notna() & decision_at.notna() & (ts > decision_at)] = "odds_after_decision"
+    usable = reason == "bet"
+    out["decision"] = reason
+    out["est_ev"] = np.nan
+    if usable.any():
+        chosen = select_bets(out[usable].reset_index().rename(columns={"index": "_row"}), p_col, -np.inf)
+        idx = chosen["_row"].to_numpy()
+        for col in ("side", "odds", "p_side", "est_ev", "won"):
+            out.loc[idx, col] = chosen[col].to_numpy()
+        out.loc[usable & ~(out["est_ev"] > threshold), "decision"] = "below_threshold"
+    return out
+
+
+def _bet_extras(bets: pd.DataFrame) -> pd.DataFrame:
+    bets = bets.copy()
+    home = bets["side"] == "home"
+    nv_home = remove_vig_two_way(bets["home_odds"], bets["away_odds"])[0]
+    bets["market_prob_side_novig"] = np.where(home, nv_home, 1 - nv_home)
+    bets["edge"] = bets["p_side"] - bets["market_prob_side_novig"]
+    if {"close_home_odds", "close_away_odds"} <= set(bets.columns):
+        closed = bets["close_home_odds"].notna() & bets["close_away_odds"].notna()
+        bets["clv"] = np.nan
+        if closed.any():
+            c = bets[closed]
+            side_close = np.where(c["side"] == "home", c["close_home_odds"], c["close_away_odds"])
+            other_close = np.where(c["side"] == "home", c["close_away_odds"], c["close_home_odds"])
+            bets.loc[closed, "clv"] = closing_line_value(c["odds"], side_close, other_close)
+    return bets
+
+
+def paper_trade(preds: pd.DataFrame, p_col: str, config: BettingConfig = BettingConfig(), n_boot: int = 1000,
+                seed: int = 0, require_timestamps: bool = True, thresholds=SWEEP_THRESHOLDS):
+    """Simulated betting on walk-forward predictions with archived, timestamped prices.
+
+    Returns (bets, summary). summary["status"] is "no_valid_odds" when nothing could be simulated;
+    no synthetic prices are ever substituted.
+    """
+    decided = decision_table(preds, p_col, config.ev_threshold, require_timestamps)
+    counts = decided["decision"].value_counts().reindex(DECISIONS, fill_value=0).astype(int).to_dict()
+    summary = {"model": p_col, "decisions": counts, "ev_threshold": config.ev_threshold,
+               "require_timestamps": require_timestamps,
+               "caveat": "SIMULATED paper trading on archived prices. Estimated EV assumes the model is right; "
+                         "realised profit in one historical sample is noisy, see the ROI CI. Not a claim of "
+                         "future profitability."}
+    priced = decided[decided["decision"].isin(["bet", "below_threshold"])]
+    if priced.empty:
+        summary["status"] = "no_valid_odds"
+        return None, summary
+    bets = _bet_extras(decided[decided["decision"] == "bet"].assign(game_id=lambda d: d["game_key"]))
+    if bets.empty:
+        summary["status"] = "no_bets_above_threshold"
+        return bets, summary
+    bets, sim = simulate(bets, config, n_boot, seed)
+    summary.update(sim)
+    summary["status"] = "ok"
+    summary["mean_edge_vs_novig"] = float(bets["edge"].mean())
+    summary["mean_overround"] = float(overround(bets["home_odds"], bets["away_odds"]).mean())
+    if "clv" in bets and bets["clv"].notna().any():
+        summary["clv"] = {"n": int(bets["clv"].notna().sum()), "mean": float(bets["clv"].mean()),
+                          "share_positive": float((bets["clv"] > 0).mean())}
+    summary["overfitting_check"] = threshold_sweep(priced.assign(game_id=lambda d: d["game_key"]), p_col,
+                                                   thresholds, n_boot, seed)
+    return bets, summary
+
+
+def threshold_sweep(priced: pd.DataFrame, p_col: str, thresholds=SWEEP_THRESHOLDS, n_boot=1000, seed=0) -> dict:
+    """Flat-stake ROI at several EV thresholds. Picking the best of k thresholds after the fact
+    inflates its ROI, so the best one also gets a Bonferroni-widened (alpha / k) interval."""
+    rows = []
+    for t in thresholds:
+        b = priced[priced["est_ev"] > t]
+        if b.empty:
+            rows.append({"threshold": t, "n_bets": 0})
+            continue
+        pnl = np.where(b["won"] == 1, b["odds"] - 1, -1.0)
+        roi = cluster_bootstrap_ratio(pnl, np.ones(len(b)), b["date"], n_boot, seed)
+        rows.append({"threshold": t, "n_bets": int(len(b)), "roi": roi["estimate"], "ci_low": roi["ci_low"],
+                     "ci_high": roi["ci_high"]})
+    valid = [r for r in rows if r["n_bets"]]
+    out = {"by_threshold": rows, "n_thresholds_tried": len(thresholds),
+           "n_positive_roi": int(sum(r["roi"] > 0 for r in valid))}
+    if valid:
+        best = max(valid, key=lambda r: r["roi"])
+        b = priced[priced["est_ev"] > best["threshold"]]
+        pnl = np.where(b["won"] == 1, b["odds"] - 1, -1.0)
+        adj = cluster_bootstrap_ratio(pnl, np.ones(len(b)), b["date"], n_boot, seed,
+                                      alpha=0.05 / len(thresholds))
+        out["best_threshold"] = best["threshold"]
+        out["best_roi_bonferroni_ci"] = [adj["ci_low"], adj["ci_high"]]
+        out["interpretation"] = ("best-threshold ROI interval excludes 0" if adj["ci_low"] > 0
+                                 else "no threshold shows ROI distinguishable from 0 after multiple-testing "
+                                      "adjustment")
+    return out

@@ -7,6 +7,14 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
+# Team box-score totals kept from LeagueGameFinder (enough to estimate possessions).
+BOX_STATS = ["fgm", "fga", "fg3m", "fta", "oreb", "dreb", "tov"]
+
+
+def normalize_game_id(ids: pd.Series) -> pd.Series:
+    """NBA game ids are 10-digit strings ("0022401187"); CSV round trips drop the zeros."""
+    return ids.astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(10)
+
 
 def team_logs_to_games(logs: pd.DataFrame) -> pd.DataFrame:
     """Convert nba_api LeagueGameFinder team rows (two per game) into one row per game.
@@ -38,7 +46,8 @@ def team_logs_to_games(logs: pd.DataFrame) -> pd.DataFrame:
         logs["GAME_ID"].isin(neutral) & (logs["TEAM_ABBREVIATION"] == logs["_nominal_home"]))
     keep = logs[logs["GAME_ID"].isin(regular.union(neutral))]
     home, away = keep[keep["_is_home"]], keep[~keep["_is_home"]]
-    merged = home.merge(away[["GAME_ID", "TEAM_ABBREVIATION", "PTS"]], on="GAME_ID", suffixes=("_h", "_a"))
+    box = [c.upper() for c in BOX_STATS if c.upper() in logs.columns]
+    merged = home.merge(away[["GAME_ID", "TEAM_ABBREVIATION", "PTS"] + box], on="GAME_ID", suffixes=("_h", "_a"))
     if len(merged) != len(regular) + len(neutral):
         log.warning("%d games lost while pairing home/away rows",
                     len(regular) + len(neutral) - len(merged))
@@ -53,7 +62,41 @@ def team_logs_to_games(logs: pd.DataFrame) -> pd.DataFrame:
         "neutral_site": merged["GAME_ID"].isin(neutral).astype(int),
         "game_id_source": merged["GAME_ID"],
     })
+    for col in box:
+        games[f"home_{col.lower()}"] = merged[f"{col}_h"].to_numpy()
+        games[f"away_{col.lower()}"] = merged[f"{col}_a"].to_numpy()
     return games.sort_values(["date", "home_team"]).reset_index(drop=True)
+
+
+def merge_schedule_info(games: pd.DataFrame, schedule_games: pd.DataFrame) -> pd.DataFrame:
+    """Add tip-off times and neutral-site flags from `schedule_to_games` output, matched on game id.
+
+    The schedule's isNeutral flag is reliable for older seasons where LeagueGameFinder
+    reports neutral games as ordinary home/away games; a game is neutral if either says so.
+    """
+    out = games.copy()
+    sched = schedule_games.assign(game_id_source=normalize_game_id(schedule_games["game_id_source"]))
+    sched = sched.drop_duplicates("game_id_source").set_index("game_id_source")
+    key = normalize_game_id(out["game_id_source"])
+    out["game_id_source"] = key
+    out["tipoff_utc"] = key.map(sched["tipoff_utc"])
+    out["neutral_site"] = (out["neutral_site"].astype(int) | key.map(sched["neutral_site"]).fillna(0).astype(int))
+    return out
+
+
+def merge_box_scores(games: pd.DataFrame, box_games: pd.DataFrame) -> pd.DataFrame:
+    """Fill box-score columns in `games` (e.g. schedule rows) from `team_logs_to_games` output."""
+    out = games.copy()
+    cols = [c for c in box_games.columns if c.startswith(("home_", "away_")) and c[5:] in BOX_STATS]
+    if not cols:
+        return out
+    box = box_games.assign(game_id_source=normalize_game_id(box_games["game_id_source"]))
+    box = box.drop_duplicates("game_id_source").set_index("game_id_source")[cols]
+    key = normalize_game_id(out["game_id_source"])
+    out["game_id_source"] = key
+    for c in cols:
+        out[c] = key.map(box[c])
+    return out
 
 
 def schedule_to_games(schedule: pd.DataFrame) -> pd.DataFrame:

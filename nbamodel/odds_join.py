@@ -69,3 +69,18 @@ def attach_odds(games: pd.DataFrame, snapshots: pd.DataFrame, book: str = "draft
             out.at[i, "odds_book"] = row["book"]
         out.at[i, "odds_timestamp"] = latest["observed_at"].iloc[0]
     return out
+
+
+def attach_odds_with_close(games: pd.DataFrame, snapshots: pd.DataFrame, book: str = "draftkings",
+                           lead_minutes: float = 60.0) -> pd.DataFrame:
+    """attach_odds plus closing prices: the last quote observed before tip-off (lead 0).
+
+    The decision price (home_odds/away_odds) is what a simulated bet may use; the close_* columns
+    are only for measuring closing-line value after the fact.
+    """
+    out = attach_odds(games, snapshots, book, lead_minutes)
+    close = attach_odds(games, snapshots, book, lead_minutes=0.0)
+    out["close_home_odds"] = close["home_odds"].to_numpy()
+    out["close_away_odds"] = close["away_odds"].to_numpy()
+    out["close_odds_timestamp"] = close["odds_timestamp"].to_numpy()
+    return out
