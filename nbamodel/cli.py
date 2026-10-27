@@ -17,6 +17,8 @@ Phase 3 (odds, market benchmark, blending, paper trading):
   blend-study      early-season Elo blending, weights chosen on earlier seasons only
   market-benchmark models vs the no-vig market at matching prediction times
   paper-trade      paper decisions and the simulated ledger (never real bets)
+  today            game-day workflow: refresh stale odds, predict a date, log and report
+  weekly-report    Markdown weekly report: accuracy, Brier, log loss, calibration, market, paper
 
 Settings come from config/phase2.json (override with --config); paths can be
 overridden per command. Secrets (ODDS_API_KEY) come from the environment or .env.
@@ -428,7 +430,7 @@ def cmd_update_results(args, cfg):
         metrics = store.snapshot_metrics(con)
         _, ratings = compute_elo(games, ds_config(cfg).elo)
         store.snapshot_elo(con, ratings)
-        print(f"results recorded for {rec['results_recorded']} predicted games; scored {rec['predictions_scored']} "
+        print(f"new results recorded for {rec['results_recorded']} predicted games; scored {rec['predictions_scored']} "
               f"predictions ({rec['late_predictions']} made after tip-off, excluded from metrics)")
         if remapped:
             print(f"matched {remapped} previously unmatched odds snapshots to games")
@@ -653,6 +655,171 @@ def cmd_market_benchmark(args, cfg):
     return 0
 
 
+def _validated_metrics(cfg, champion: str) -> dict:
+    """Out-of-sample metrics for the champion from the stored reports (never recomputed here)."""
+    out = {}
+    for key, sub in (("development walk-forward", "walkforward_dir"), ("final holdout", "final_test_dir")):
+        rp = Path(cfg["paths"][sub]) / "report.json"
+        if rp.exists():
+            rep = json.loads(rp.read_text())
+            m = rep["models"].get(champion)
+            if m:
+                out[key] = {"log_loss": m["log_loss"], "brier": m["brier"], "n": m["n"],
+                            "range": rep["date_range"]}
+    return out
+
+
+def cmd_today(args, cfg):
+    """Game-day workflow: refresh odds only if stale, predict the target date, log, report."""
+    now = pd.Timestamp.now(tz="UTC")
+    target = pd.Timestamp(args.date) if args.date else pd.Timestamp(now.tz_convert("US/Eastern").date())
+    games, _, _ = load_games_from(cfg, args.games, None)
+    model, meta = registry.load_model(None, cfg["paths"]["artifacts"])
+    champion = (meta.get("reference_metrics") or {}).get("champion", f"p_{meta['model']}")
+    book = args.book or cfg.get("paper", {}).get("book", cfg["paths"]["book"])
+    day = games[games["date"] == target].copy()
+    if day.empty:
+        print(f"no NBA games scheduled on {target.date()} in {cfg['paths']['games']} (run `make data-update`)")
+        return 0
+    tip = pd.to_datetime(day["tipoff_utc"], utc=True, errors="coerce")
+    excluded = []
+    for r, t in zip(day.itertuples(), tip):
+        g = f"{r.away_team} @ {r.home_team}"
+        if r.played:
+            excluded.append((g, "final result already recorded"))
+        elif pd.isna(t):
+            excluded.append((g, "no scheduled tip-off time"))
+        elif t <= now:
+            excluded.append((g, f"already started (tip-off {t:%H:%M} UTC)"))
+    pending = day[~day["played"] & tip.notna() & (tip > now)]
+
+    # 1) odds: reuse the archive when fresh, otherwise spend one credit
+    with store.connect(cfg["paths"]["db"]) as con:
+        snap = odds_store.load_snapshots(con, book=book)
+        mine = snap[snap["game_key"].isin(pending["game_key"])]
+        last = mine["observed_at"].max() if len(mine) else None
+        fresh = last is not None and (now - last) <= pd.Timedelta(minutes=args.max_odds_age)
+        covered = set(mine["game_key"]) >= set(pending["game_key"])
+        odds_note = f"reused archive (latest {last:%Y-%m-%d %H:%M:%S} UTC)" if last is not None else "none archived"
+        if not pending.empty and not args.no_refresh and not (fresh and covered):
+            res = odds_collect.collect(con, _provider(args, cfg), games, _schedule(cfg), force=True)
+            if res["status"] == "ok":
+                odds_note = (f"fetched now from The Odds API (run {res['run_id']}, {res['n_inserted']} prices, "
+                             f"{(res.get('usage') or {}).get('x-requests-remaining')} credits left)")
+            else:
+                odds_note += f"; refresh FAILED ({res.get('error')}), using archive"
+    if pending.empty:
+        print(f"{target.date()}: no games left to predict before tip-off")
+        for g, why in excluded:
+            print(f"  excluded {g}: {why}")
+        return 0
+
+    # 2) predictions with prices as of the prediction timestamp
+    horizon = int((target - games.loc[~games["played"], "date"].min()).days) + 1
+    preds = predict_upcoming(games, model, meta, max(horizon, 1), now)
+    preds = preds[preds["date"] == target]
+    preds = _add_shadow_blend(preds, games, cfg)
+    with store.connect(cfg["paths"]["db"]) as con:
+        preds, quotes = market.attach_market_asof(preds, odds_store.load_snapshots(con), book,
+                                                  cfg.get("odds", {}).get("max_age_minutes", 120))
+        n = store.log_predictions(con, preds)
+        n_q = store.log_prediction_odds(con, preds, quotes)
+        decided = pd.DataFrame()
+        if cfg.get("paper", {}).get("enabled"):
+            decided = paper.decide(con, paper.PaperConfig.from_dict(cfg.get("paper")),
+                                   model_version=preds["model_version"].iloc[0])
+    out = Path(args.out or f"out/today/predictions_{target.date()}.csv")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    preds.to_csv(out, index=False, float_format="%.6f")
+
+    # 3) report
+    t = meta["training"]
+    print(f"NBA moneyline predictions for {target.date()} (US/Eastern game date)")
+    print(f"model: {meta['model']}  version {meta['version']}  trained {meta['trained_at'][:16]} UTC")
+    print(f"training games: {t['start']} to {t['end']} ({t['n_rows']} games); features use results through "
+          f"{preds['latest_result_in_data'].iloc[0]}")
+    for k, m in _validated_metrics(cfg, champion).items():
+        print(f"validated ({k}, {m['range'][0]} to {m['range'][1]}, n={m['n']}): log loss {m['log_loss']:.4f}, "
+              f"Brier {m['brier']:.4f}")
+    print(f"prediction timestamp: {preds['prediction_timestamp'].iloc[0]}")
+    print(f"odds: book {book}, {odds_note}")
+    rows = []
+    preds = preds.assign(_tip=pd.to_datetime(preds["tipoff_utc"], utc=True)).sort_values(["_tip", "game_key"])
+    for r in preds.to_dict("records"):
+        home = r["p_home"] >= 0.5
+        winner = r["home_team"] if home else r["away_team"]
+        p_w = r["p_home"] if home else r["p_away"]
+        fair = r["fair_home_american"] if home else r["fair_away_american"]
+        flags = []
+        if pd.notna(r["home_odds"]):
+            h_am = decimal_to_american_int(r["home_odds"])
+            a_am = decimal_to_american_int(r["away_odds"])
+            age = (pd.Timestamp(r["prediction_timestamp"]) - pd.Timestamp(r["odds_timestamp"])).total_seconds() / 60
+            if age > args.max_odds_age:
+                flags.append(f"odds {age:.0f} min old")
+            nv_w = r["market_home_prob_novig"] if home else 1 - r["market_home_prob_novig"]
+            fav = r["home_team"] if r["market_home_prob_novig"] > 0.5 else r["away_team"]
+            book_s = f"{r['home_team']} {h_am:+d} / {r['away_team']} {a_am:+d}"
+            edge = f"{p_w - nv_w:+.3f}"
+            roi = f"{(r['ev_home'] if home else r['ev_away']):+.1%}"
+            nv = f"{r['market_home_prob_novig']:.3f}/{1 - r['market_home_prob_novig']:.3f}"
+            differs = "YES" if fav != winner else "no"
+        else:
+            book_s, edge, roi, nv, differs = "missing", "n/a", "n/a", "n/a", "n/a"
+            flags.append("no sportsbook price")
+        if r["low_history"]:
+            flags.append("early season (<5 games)")
+        rows.append({"Tip-off (ET)": r["_tip"].tz_convert("US/Eastern").strftime("%I:%M %p"),
+                     "Game": f"{r['away_team']} @ {r['home_team']}", "Predicted Winner": winner,
+                     "Win Probability": f"{p_w:.1%}", "Model Fair Odds": f"{fair:+d}",
+                     "Sportsbook Odds": book_s, "No-vig (home/away)": nv, "Estimated Edge": edge,
+                     "Expected ROI": roi, "Differs from book favorite": differs, "Flags": "; ".join(flags)})
+    table = pd.DataFrame(rows)
+    print()
+    print(_markdown(table) if args.markdown else table.to_string(index=False))
+    print("\nEstimated Edge = model minus no-vig market probability for the predicted winner; Expected ROI = "
+          "model probability x book decimal odds - 1 for that side. Both assume the model is right. The most "
+          "likely winner is not necessarily the best value, and neither column is a betting recommendation.")
+    for g, why in excluded:
+        print(f"excluded {g}: {why}")
+    print(f"saved {n} predictions ({n_q} book prices recorded with them) to {cfg['paths']['db']}; wrote {out}")
+    if not decided.empty:
+        print("paper decisions made now (SIMULATED): " + ", ".join(
+            f"{k} {v}" for k, v in decided["decision"].value_counts().items()))
+    print("Paper decisions for later tip-offs are made by the scheduled collector 30-90 min before tip-off. "
+          "No real bets are placed.")
+    return 0
+
+
+def _markdown(df: pd.DataFrame) -> str:
+    lines = ["| " + " | ".join(df.columns) + " |", "|" + "---|" * len(df.columns)]
+    lines += ["| " + " | ".join(str(v) for v in r) + " |" for r in df.itertuples(index=False)]
+    return "\n".join(lines)
+
+
+def decimal_to_american_int(d) -> int:
+    from .odds import decimal_to_american
+    return int(round(float(decimal_to_american(float(d)))))
+
+
+def cmd_weekly_report(args, cfg):
+    from . import weekly
+    end = (pd.Timestamp(args.end) if args.end else pd.Timestamp.now(tz="UTC").tz_convert("US/Eastern").normalize()
+           .tz_localize(None) + pd.Timedelta(days=1)).tz_localize("UTC")
+    ref = {}
+    version = registry.active_version(cfg["paths"]["artifacts"])
+    if version:
+        ref = registry.load_model(version, cfg["paths"]["artifacts"])[1].get("reference_metrics", {})
+    with store.connect(cfg["paths"]["db"]) as con:
+        text = weekly.build(con, cfg, end, args.days, ref, cfg["evaluation"]["n_boot"])
+    out = Path(args.out or f"out/reports/weekly_{(end - pd.Timedelta(days=1)).date()}.md")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text + "\n")
+    print(text)
+    print(f"\nwrote {out}")
+    return 0
+
+
 def cmd_paper_trade(args, cfg):
     pcfg = paper.PaperConfig.from_dict(cfg.get("paper"))
     with store.connect(cfg["paths"]["db"]) as con:
@@ -744,6 +911,19 @@ def build_parser():
     mb = sub.add_parser("market-benchmark", help="models vs no-vig market at matching prediction times")
     mb.add_argument("--book")
     mb.add_argument("--out")
+    wr = sub.add_parser("weekly-report", help="Markdown weekly performance report from the live log")
+    wr.add_argument("--days", type=int, default=7)
+    wr.add_argument("--end", help="exclusive end date (default: tomorrow, US/Eastern)")
+    wr.add_argument("--out")
+    td = sub.add_parser("today", help="game-day workflow: refresh stale odds, predict a date, log, report")
+    td.add_argument("--date", help="US/Eastern game date (default: today)")
+    td.add_argument("--games")
+    td.add_argument("--book")
+    td.add_argument("--max-odds-age", type=float, default=30.0,
+                    help="reuse archived odds younger than this many minutes (default 30)")
+    td.add_argument("--no-refresh", action="store_true", help="never call the API; use the archive only")
+    td.add_argument("--markdown", action="store_true")
+    td.add_argument("--out")
     pt = sub.add_parser("paper-trade", help="make due paper decisions and report the simulated ledger")
     pt.add_argument("--report-only", action="store_true")
     pt.add_argument("--now", help="decision clock (UTC ISO) for replaying logged predictions; default now")
@@ -755,7 +935,8 @@ COMMANDS = {"build-dataset": cmd_build_dataset, "walk-forward": cmd_walk_forward
             "update-results": cmd_update_results, "dashboard": cmd_dashboard,
             "collect-odds": cmd_collect_odds, "odds-plan": cmd_odds_plan, "odds-status": cmd_odds_status,
             "import-odds": cmd_import_odds, "blend-study": cmd_blend_study, "market-benchmark": cmd_market_benchmark,
-            "paper-trade": cmd_paper_trade}
+            "paper-trade": cmd_paper_trade, "today": cmd_today,
+            "weekly-report": cmd_weekly_report}
 
 
 def main(argv=None) -> int:

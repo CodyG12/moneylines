@@ -205,9 +205,11 @@ def reconcile(con: sqlite3.Connection, games: pd.DataFrame, now: pd.Timestamp | 
     played = games[games["played"]]
     keys = set(pd.read_sql("SELECT DISTINCT game_key FROM predictions", con)["game_key"])
     res = played[played["game_key"].isin(keys)]
+    before = con.total_changes
     con.executemany("INSERT OR IGNORE INTO results VALUES (?,?,?,?,?)",
                     [(r.game_key, int(r.home_score), int(r.away_score), int(r.home_win), now)
                      for r in res.itertuples()])
+    new_results = con.total_changes - before
     pending = pd.read_sql("""SELECT p.id, p.game_key, p.p_home, p.prediction_ts, p.tipoff_utc, p.game_date,
                              r.home_win FROM predictions p JOIN results r USING (game_key)
                              LEFT JOIN evaluations e ON e.prediction_id = p.id WHERE e.prediction_id IS NULL""", con)
@@ -219,7 +221,7 @@ def reconcile(con: sqlite3.Connection, games: pd.DataFrame, now: pd.Timestamp | 
             for i, k, yy, pp, lt, ll, br in zip(pending["id"], pending["game_key"], y, p, late,
                                                 per_game_log_loss(y, p), per_game_brier(y, p))])
     con.commit()
-    return {"results_recorded": int(len(res)), "predictions_scored": int(len(pending)),
+    return {"results_recorded": int(new_results), "predictions_scored": int(len(pending)),
             "late_predictions": int(late.sum()) if not pending.empty else 0}
 
 

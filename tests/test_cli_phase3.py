@@ -109,3 +109,22 @@ def test_collect_without_key_explains(env, monkeypatch, tmp_path, capsys):
     d, _ = env
     assert cli.main(["--config", str(d / "cfg.json"), "collect-odds", "--force"]) == 2
     assert "the-odds-api.com" in capsys.readouterr().err
+
+
+def test_today_excludes_started_games_without_calling_the_api(env, capsys):
+    d, cfg = env
+    day = pd.read_csv(cfg["paths"]["games"])["date"].max()      # synthetic games are all in the past
+    assert run(env, "today", "--date", day, "--no-refresh") == 0
+    out = capsys.readouterr().out
+    assert "no games left to predict" in out and ("already started" in out or "final result" in out)
+
+
+def test_weekly_report_from_stored_records(env, capsys):
+    d, cfg = env
+    with store.connect(cfg["paths"]["db"]) as con:
+        last = con.execute("SELECT MAX(game_date) FROM predictions").fetchone()[0]
+    end = (pd.Timestamp(last) + pd.Timedelta(days=1)).date().isoformat()
+    assert run(env, "weekly-report", "--end", end, "--out", str(d / "weekly.md")) == 0
+    text = (d / "weekly.md").read_text()
+    for section in ("Prediction accuracy", "Calibration", "Model vs market", "Paper trading", "Data collection"):
+        assert section in text

@@ -4,7 +4,7 @@ SEASON ?= 2026-27
 NBA = $(PY) -m nbamodel
 
 .PHONY: test data-fetch data-update dataset walk-forward final-test train predict update-results retrain dashboard daily phase1 \
-        collect-odds odds-plan odds-status blend-study market-benchmark paper-trade
+        collect-odds odds-plan odds-status blend-study market-benchmark paper-trade today weekly-report
 
 test:            ## full pytest suite
 	$(PY) -m pytest -q
@@ -61,6 +61,14 @@ market-benchmark: ## models vs no-vig market at matching prediction times
 
 paper-trade:     ## due paper decisions + SIMULATED ledger report (never real bets)
 	$(NBA) paper-trade
+
+today:           ## game day: refresh results, reconcile last night, refresh stale odds, predict today
+	$(MAKE) -s data-update
+	$(NBA) update-results
+	$(NBA) today
+
+weekly-report:   ## last 7 days: accuracy, Brier, log loss, calibration, market, paper -> out/reports/
+	$(NBA) weekly-report
 
 phase1:          ## original Phase 1 pipeline (unchanged)
 	$(PY) nba_model.py --games data/raw/nba_games.csv --output out/nba/predictions.csv --upcoming-days 3
