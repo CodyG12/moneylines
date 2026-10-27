@@ -471,6 +471,54 @@ HISTORICAL EVALUATION or SIMULATED.
 - Proportional de-vig is the only method implemented. Power and Shin methods would shift
   longshot probabilities slightly.
 
+## Daily operation
+
+Everything below is paper trading and research. Nothing places a real bet.
+
+**Every game day (one command):**
+
+```bash
+make today
+```
+
+It runs four steps:
+1. Refreshes results and the schedule from nba_api.
+2. Reconciles finished games: adds results and scores, updates accuracy, Brier and log loss, settles
+   paper decisions and computes CLV.
+3. Reuses archived odds if they are under 30 minutes old; otherwise it spends 1 Odds API credit.
+4. Predicts today's not-yet-started games with the active model and saves each prediction with its
+   model version, timestamp, feature snapshot and every book price available at that moment. Then it
+   prints the table: predicted winner, win probability, fair odds, book odds, no-vig probabilities,
+   edge, expected ROI, whether the pick differs from the book favourite, and flags.
+
+Variants: `python -m nbamodel today --date 2026-10-28` for another date, `--no-refresh` to never
+call the API, `--markdown` for a Markdown table.
+
+**Automatic (once installed with `scripts/install_odds_schedule.sh`):** the LaunchAgent runs
+`scripts/collect_odds_cron.sh` every 5 minutes. It takes odds snapshots 24 h, 6 h, 1 h and 15 min
+before tip-off and logs predictions and paper decisions with each one. Once a day after 10:00 UTC
+it runs data-update, update-results (with a retrain when the 7-day cadence is due) and dashboard.
+Logs go to `logs/odds_collect.log` and `logs/reconcile.log`.
+
+**Weekly:**
+
+```bash
+make weekly-report     # out/reports/weekly_<date>.md
+```
+
+The report covers accuracy, Brier, log loss, calibration bins, model vs market by horizon, paper
+trading (win rate vs break-even, ROI with CI, drawdown, CLV) and data-collection health.
+
+**Reconciliation never edits a prediction.** Results, scores, paper results and CLV go into separate
+tables (`results`, `evaluations`, `paper_results`, `clv_results`). The original probability, feature
+snapshot and recorded prices stay as they were written.
+
+**Limits of the local schedule:** a LaunchAgent runs only while you are logged in and the Mac is
+awake. It does not run while the computer is asleep or off. Missed snapshot targets are recorded as
+missed. After a wake, the next 5-minute run catches up on reconciliation, but missed odds cannot be
+recovered. To keep collecting with the Mac off, run the same `scripts/collect_odds_cron.sh` on an
+always-on machine (a small VPS or a Raspberry Pi) with the repo, `.venv`, `.env` and the database.
+
 ## Layout
 
 ```
