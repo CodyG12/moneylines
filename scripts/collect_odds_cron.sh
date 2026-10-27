@@ -10,8 +10,12 @@ cd "$(dirname "$0")/.." || exit 1
 mkdir -p logs
 .venv/bin/python -W ignore -m nbamodel collect-odds --then-predict >> logs/odds_collect.log 2>&1
 
+# One attempt per hour at most, so a failing nba_api fetch is not retried every 5 minutes.
 stamp="logs/.reconciled-$(date -u +%Y-%m-%d)"
-if [ "$(date -u +%H)" -ge 10 ] && [ ! -e "$stamp" ]; then
+attempt="logs/.reconcile-attempt-$(date -u +%Y-%m-%dT%H)"
+if [ "$(date -u +%H)" -ge 10 ] && [ ! -e "$stamp" ] && [ ! -e "$attempt" ]; then
+  touch "$attempt"
+  find logs -name '.reconcile-attempt-*' -mtime +2 -delete 2>/dev/null
   {
     echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) daily reconcile"
     make -s data-update && make -s retrain && make -s dashboard && touch "$stamp"
