@@ -1,7 +1,7 @@
 {
   "paths": {
     "games": "data/raw/nba_games.csv",
-    "odds": null,
+    "odds": "db",
     "book": "draftkings",
     "db": "data/predictions.db",
     "artifacts": "artifacts/models",
@@ -10,13 +10,21 @@
     "final_test_dir": "out/final_test",
     "final_test_log": "artifacts/final_test_log.jsonl",
     "upcoming": "out/upcoming_predictions.csv",
-    "dashboard": "out/dashboard/index.html"
+    "dashboard": "out/dashboard/index.html",
+    "blend": "artifacts/blend.json",
+    "blend_dir": "out/blend"
   },
   "dataset": {
     "window": 10,
     "lead_minutes": 60,
     "min_history": 5,
-    "elo": {"k": 20.0, "home_advantage": 100.0, "initial_rating": 1500.0, "season_carryover": 0.75, "use_margin": true}
+    "elo": {
+      "k": 20.0,
+      "home_advantage": 100.0,
+      "initial_rating": 1500.0,
+      "season_carryover": 0.75,
+      "use_margin": true
+    }
   },
   "walk_forward": {
     "retrain": "monthly",
@@ -35,7 +43,7 @@
     "flat_stake": 1.0,
     "kelly_multiplier": 0.25,
     "max_bet_fraction": 0.02,
-    "max_daily_exposure": 0.10,
+    "max_daily_exposure": 0.1,
     "initial_bankroll": 100.0
   },
   "feedback": {
@@ -44,6 +52,52 @@
     "degradation_window": 300,
     "degradation_z": 2.0
   },
-  "predict": {"horizon_days": 3},
-  "evaluation": {"n_boot": 1000, "seed": 0}
+  "predict": {
+    "horizon_days": 3
+  },
+  "evaluation": {
+    "n_boot": 1000,
+    "seed": 0
+  },
+  "odds": {
+    "provider": "the-odds-api",
+    "regions": "us",
+    "bookmakers": null,
+    "retries": 4,
+    "max_age_minutes": 120,
+    "schedule": {
+      "offsets_minutes": [
+        1440,
+        360,
+        60,
+        15
+      ],
+      "poll_minutes": 5,
+      "credits_per_call": 1,
+      "monthly_credit_budget": 500,
+      "reserve_credits": 25
+    }
+  },
+  "paper": {
+    "enabled": true,
+    "strategy": "live-default",
+    "book": "draftkings",
+    "ev_threshold": 0.02,
+    "decision_min_lead_minutes": 30,
+    "decision_max_lead_minutes": 90,
+    "max_odds_age_minutes": 120,
+    "flat_stake": 1.0,
+    "kelly_multiplier": 0.25,
+    "max_bet_fraction": 0.02,
+    "max_stake_units": 5.0,
+    "max_daily_exposure": 0.1,
+    "initial_bankroll": 100.0,
+    "skip_low_history": false,
+    "max_model_spread": 0.2,
+    "close_window_minutes": 30,
+    "max_abs_edge": 0.1
+  },
+  "blend": {
+    "base_col": "p_logistic_raw"
+  }
 }

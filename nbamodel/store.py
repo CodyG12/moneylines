@@ -60,6 +60,56 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 """
 
+# Phase 3. Every table here is append-only: rows are inserted once and never updated, so a stored
+# price, probability or decision always shows what was known when it was written.
+PHASE3_SCHEMA = """
+CREATE TABLE IF NOT EXISTS odds_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL, source TEXT NOT NULL, provider_event_id TEXT NOT NULL,
+    game_key TEXT, match_status TEXT NOT NULL, flipped INTEGER NOT NULL DEFAULT 0,
+    home_team TEXT, away_team TEXT, provider_home_name TEXT, provider_away_name TEXT,
+    book TEXT NOT NULL, market TEXT NOT NULL DEFAULT 'h2h',
+    home_american REAL, away_american REAL, home_decimal REAL NOT NULL, away_decimal REAL NOT NULL,
+    commence_time TEXT, tipoff_utc TEXT,
+    observed_at TEXT NOT NULL, provider_ts TEXT, retrieved_at TEXT NOT NULL,
+    is_pregame INTEGER NOT NULL, run_id INTEGER,
+    UNIQUE (provider, provider_event_id, book, market, observed_at)
+);
+CREATE INDEX IF NOT EXISTS odds_snapshots_game ON odds_snapshots (game_key, book, observed_at);
+CREATE TABLE IF NOT EXISTS odds_collection_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT, provider TEXT, mode TEXT,
+    status TEXT, reason TEXT, n_events INTEGER, n_rows INTEGER, n_inserted INTEGER, n_duplicates INTEGER,
+    n_invalid INTEGER, n_unmatched INTEGER, n_live INTEGER, credits_used INTEGER, credits_remaining INTEGER,
+    error TEXT, targets_json TEXT
+);
+CREATE TABLE IF NOT EXISTS prediction_odds (
+    prediction_id INTEGER NOT NULL REFERENCES predictions(id), book TEXT NOT NULL, snapshot_id INTEGER,
+    observed_at TEXT NOT NULL, home_decimal REAL NOT NULL, away_decimal REAL NOT NULL,
+    home_american REAL, away_american REAL, PRIMARY KEY (prediction_id, book)
+);
+CREATE TABLE IF NOT EXISTS paper_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, strategy TEXT NOT NULL, prediction_id INTEGER NOT NULL,
+    game_key TEXT NOT NULL, game_date TEXT, tipoff_utc TEXT, model_version TEXT NOT NULL, p_col TEXT,
+    decided_at TEXT NOT NULL, decision TEXT NOT NULL, book TEXT, side TEXT, p_side REAL,
+    decimal_odds REAL, american_odds REAL, odds_observed_at TEXT, market_p_side_novig REAL, edge REAL,
+    est_ev REAL, stake_flat REAL, stake_kelly REAL, bankroll_at_decision REAL, details_json TEXT,
+    UNIQUE (strategy, game_key)
+);
+CREATE TABLE IF NOT EXISTS paper_results (
+    decision_id INTEGER PRIMARY KEY REFERENCES paper_decisions(id), home_win INTEGER, won INTEGER,
+    pnl_flat REAL, pnl_kelly REAL, resolved_at TEXT
+);
+CREATE TABLE IF NOT EXISTS clv_results (
+    decision_id INTEGER PRIMARY KEY REFERENCES paper_decisions(id), status TEXT NOT NULL, book TEXT,
+    comparison TEXT, decision_decimal REAL, close_decimal REAL, close_observed_at TEXT, price_clv REAL,
+    open_novig REAL, close_novig REAL, novig_prob_move REAL, computed_at TEXT
+);
+"""
+
+# Component probabilities logged next to the published one, so every model can be benchmarked
+# against the market on exactly the same games and timestamps. Added to old databases in place.
+COMPONENT_COLUMNS = ("p_elo", "p_logistic", "p_logistic_raw", "p_gbm", "p_gbm_raw", "p_ensemble", "p_blend")
+
 METRIC_WINDOWS = {"all": None, "last_100": 100, "last_300": 300}
 
 
@@ -67,6 +117,12 @@ def connect(path=DEFAULT_DB) -> sqlite3.Connection:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(path))
     con.executescript(SCHEMA)
+    con.executescript(PHASE3_SCHEMA)
+    have = {r[1] for r in con.execute("PRAGMA table_info(predictions)")}
+    for col in COMPONENT_COLUMNS:
+        if col not in have:
+            con.execute(f"ALTER TABLE predictions ADD COLUMN {col} REAL")
+    con.commit()
     return con
 
 
@@ -95,13 +151,34 @@ def log_predictions(con: sqlite3.Connection, preds: pd.DataFrame) -> int:
             str(r["odds_timestamp"]) if pd.notna(r.get("odds_timestamp")) else None,
             r.get("odds_book"), r.get("market_home_prob_novig"), r.get("model_spread"),
             int(bool(r.get("low_history"))), r.get("features_asof"), r.get("feature_snapshot"),
-            r.get("key_factors"))))
+            r.get("key_factors"), *(r.get(c) for c in COMPONENT_COLUMNS))))
     before = con.total_changes
-    con.executemany("""INSERT OR IGNORE INTO predictions (game_key, game_date, season, home_team, away_team,
+    con.executemany(f"""INSERT OR IGNORE INTO predictions (game_key, game_date, season, home_team, away_team,
         tipoff_utc, prediction_ts, model_version, p_home, p_away, fair_home_american, fair_away_american,
         fair_home_decimal, fair_away_decimal, market_home_odds, market_away_odds, market_odds_ts, market_book,
-        market_home_novig, model_spread, low_history, features_asof, feature_snapshot, key_factors)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+        market_home_novig, model_spread, low_history, features_asof, feature_snapshot, key_factors,
+        {", ".join(COMPONENT_COLUMNS)})
+        VALUES ({",".join("?" * (24 + len(COMPONENT_COLUMNS)))})""", rows)
+    con.commit()
+    return con.total_changes - before
+
+
+def log_prediction_odds(con: sqlite3.Connection, preds: pd.DataFrame, quotes: pd.DataFrame) -> int:
+    """Record every book's price that was available when each prediction was made.
+
+    `quotes` has one row per (game_key, book) from odds_store.quotes_asof. Rows are keyed to the
+    stored prediction (game_key, model_version, prediction_ts) and never updated afterwards."""
+    if quotes is None or quotes.empty or preds.empty:
+        return 0
+    ids = pd.read_sql("SELECT id, game_key, model_version, prediction_ts FROM predictions", con)
+    keyed = preds[["game_key", "model_version", "prediction_timestamp"]].rename(
+        columns={"prediction_timestamp": "prediction_ts"}).merge(ids, on=["game_key", "model_version", "prediction_ts"])
+    q = quotes.merge(keyed[["game_key", "id"]], on="game_key")
+    before = con.total_changes
+    con.executemany("INSERT OR IGNORE INTO prediction_odds VALUES (?,?,?,?,?,?,?,?)", [
+        (int(r["id"]), r["book"], _none(r.get("snapshot_id")), str(r["observed_at"]), float(r["home_decimal"]),
+         float(r["away_decimal"]), _none(r.get("home_american")), _none(r.get("away_american")))
+        for r in q.to_dict("records")])
     con.commit()
     return con.total_changes - before
 

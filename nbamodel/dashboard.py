@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import registry, store
+from . import clv, market, paper, plots, registry, store
 from .report import MODEL_LABELS, fmt_ci
 
 CSS = """
@@ -153,6 +153,161 @@ def _backtest_section(title: str, d: Path, simulated_note: str) -> str:
     return "".join(parts)
 
 
+def _ci(d) -> str:
+    return "" if not d else f"{d['estimate']:+.4f} [{d['ci_low']:+.4f}, {d['ci_high']:+.4f}]"
+
+
+def _odds_section(con, cfg: dict, now: pd.Timestamp) -> str:
+    book = cfg.get("paper", {}).get("book", cfg["paths"]["book"])
+    parts = ["<h2>Odds monitoring <span class='tag'>LIVE DATA</span></h2>"]
+    snap = pd.read_sql("SELECT * FROM odds_snapshots WHERE is_pregame = 1 AND match_status = 'matched'", con)
+    runs = pd.read_sql("SELECT started_at, status, reason, n_events, n_inserted, n_invalid, n_unmatched, n_live, "
+                       "credits_remaining, error FROM odds_collection_runs ORDER BY id DESC LIMIT 10", con)
+    n_all = con.execute("SELECT COUNT(*), COUNT(DISTINCT observed_at) FROM odds_snapshots").fetchone()
+    last_ok = runs.loc[runs["status"] == "ok", "started_at"].max() if not runs.empty else None
+    parts.append(_tiles([("Snapshot rows stored", n_all[0]), ("Distinct observation times", n_all[1]),
+                         ("Last successful collection", (last_ok or "never")[:16]),
+                         ("Credits remaining", runs["credits_remaining"].dropna().iloc[0]
+                          if not runs.empty and runs["credits_remaining"].notna().any() else "unknown")]))
+    if not snap.empty:
+        snap["observed_at"] = pd.to_datetime(snap["observed_at"], utc=True)
+        snap["tip"] = pd.to_datetime(snap["tipoff_utc"], utc=True)
+        up = snap[snap["tip"] > now].sort_values("observed_at")
+        if not up.empty:
+            latest = up.groupby(["game_key", "book"], as_index=False).tail(1)
+            first = up.groupby(["game_key", "book"], as_index=False).head(1)
+            ref = latest[latest["book"] == book].merge(
+                first[["game_key", "book", "home_american", "away_american"]], on=["game_key", "book"],
+                suffixes=("", "_open"))
+            books = latest.groupby("game_key")["book"].nunique().rename("books")
+            ref = ref.merge(books, left_on="game_key", right_index=True)
+            t = pd.DataFrame({"tip-off (UTC)": ref["tipoff_utc"].str[:16], "game": ref["away_team"] + " @ " + ref["home_team"],
+                              f"{book} home": ref["home_american"].map("{:+.0f}".format),
+                              f"{book} away": ref["away_american"].map("{:+.0f}".format),
+                              "home at first snapshot": ref["home_american_open"].map("{:+.0f}".format),
+                              "latest snapshot (UTC)": ref["observed_at"].dt.strftime("%m-%d %H:%M"),
+                              "books quoting": ref["books"]})
+            parts.append("<h3>Upcoming games: latest pregame prices</h3>" + _table(
+                t.sort_values("tip-off (UTC)"), left=("tip-off (UTC)", "game", "latest snapshot (UTC)")))
+            other = latest.assign(price=latest["home_american"].map("{:+.0f}".format) + " / " +
+                                  latest["away_american"].map("{:+.0f}".format))
+            wide = other.pivot_table(index="game_key", columns="book", values="price", aggfunc="first")
+            names = latest.drop_duplicates("game_key").set_index("game_key")
+            wide.insert(0, "game", names["away_team"] + " @ " + names["home_team"])
+            parts.append("<h3>All books (home / away, American)</h3>" + _table(wide.reset_index(drop=True),
+                                                                              left=("game",)))
+    pred = pd.read_sql("""SELECT DISTINCT p.game_key, p.game_date, p.away_team || ' @ ' || p.home_team AS game, p.tipoff_utc
+                          FROM predictions p LEFT JOIN results r USING (game_key) WHERE r.game_key IS NULL""", con)
+    if not pred.empty:
+        missing = pred[~pred["game_key"].isin(snap["game_key"] if not snap.empty else [])]
+        if not missing.empty:
+            parts.append(f"<div class='note'>Missing odds: {len(missing)} upcoming predicted game(s) have no pregame "
+                         f"snapshot yet: {_e(', '.join(missing['game']))}</div>")
+    parts.append("<h3>Recent collection runs</h3>" + _table(runs, left=("started_at", "status", "reason", "error")))
+    return "".join(parts)
+
+
+def _market_section(con, cfg: dict) -> str:
+    book = cfg.get("paper", {}).get("book", cfg["paths"]["book"])
+    parts = ["<h2>Model versus market <span class='tag'>LIVE PREDICTIONS</span></h2>",
+             f"<p class='sub'>Book: {_e(book)}. The price shown is the one recorded when the prediction was made "
+             "(observed at or before it). Market probability is no-vig (proportional). Expected ROI assumes the "
+             "model probability is correct.</p>"]
+    v = market.upcoming_market_view(con, book)
+    if v.empty:
+        parts.append("<p class='sub'>No unresolved predictions.</p>")
+    else:
+        t = pd.DataFrame({"date": v["game_date"], "game": v["away_team"] + " @ " + v["home_team"],
+                          "p(home) model": v["p_home"], "p(home) market": v["p_market"],
+                          "model fair ML": v["fair_home_american"].map("{:+d}".format) + " / " +
+                          v["fair_away_american"].map("{:+d}".format),
+                          "book ML": [f"{h:+.0f} / {a:+.0f}" if pd.notna(h) else "no price"
+                                      for h, a in zip(v["mkt_home_american"], v["mkt_away_american"])],
+                          "edge (home)": v["edge_home"], "exp. ROI home": v["exp_roi_home"],
+                          "exp. ROI away": v["exp_roi_away"], "price observed": v["mkt_observed_at"].str[5:16],
+                          "predicted at": v["prediction_ts"].str[5:16]})
+        parts.append(_table(t, left=("date", "game", "model fair ML", "book ML", "price observed", "predicted at")))
+    bench = market.live_benchmark(con, book, n_boot=300)
+    rows = []
+    for h, r in bench["by_horizon"].items():
+        if r.get("status") != "ok":
+            rows.append({"horizon before tip": h, "n": r.get("n", 0), "model": "-", "log loss": None,
+                         "minus market [95% CI]": r.get("status")})
+            continue
+        rows.append({"horizon before tip": h, "n": r["n"], "model": "Market (no-vig)",
+                     "log loss": r["market"]["log_loss"], "minus market [95% CI]": ""})
+        for c, s in r["models"].items():
+            rows.append({"horizon before tip": h, "n": r["n"], "model": MODEL_LABELS.get(c, c),
+                         "log loss": s["log_loss"], "minus market [95% CI]": _ci(s["log_loss_minus_market"])})
+    parts.append("<h3>Market benchmark on scored live predictions <span class='tag'>LIVE EVALUATION</span></h3>"
+                 "<p class='sub'>Same games and same timestamps for every row in a horizon. Negative difference "
+                 "means the model beat the market. Fewer than 500 games is preliminary.</p>"
+                 + _table(pd.DataFrame(rows), left=("horizon before tip", "model", "minus market [95% CI]")))
+    return "".join(parts)
+
+
+def _blend_section(cfg: dict) -> str:
+    rp = Path(cfg["paths"].get("blend_dir", "out/blend")) / "report.json"
+    parts = ["<h2>Early-season Elo blending <span class='tag'>HISTORICAL EVALUATION</span></h2>"]
+    if not rp.exists():
+        return parts[0] + "<p class='sub'>Not run yet: <code>python -m nbamodel blend-study</code>.</p>"
+    rep = json.loads(rp.read_text())
+    parts.append(f"<p class='sub'>P = w &times; P(Elo) + (1 &minus; w) &times; P({_e(rep['base_col'])}). Weights are "
+                 f"chosen on earlier seasons and scored on later ones ({rep['n']} development games, seasons "
+                 f"{rep['evaluated_seasons'][0]}-{rep['evaluated_seasons'][-1]}). Best method: "
+                 f"<b>{_e(rep['best_method'])}</b> {_e(rep['final_params'])}. Enabled: <b>{'yes' if rep['enabled'] else 'no'}"
+                 f"</b> (rule: {_e(rep['decision_rule'])}).</p>")
+    rows = []
+    for c, v in rep["overall"].items():
+        row = {"model": c.replace("p_blend_", "blend: "), "log loss (all)": v["log_loss"],
+               "diff vs base (all)": _ci(v.get("log_loss_diff_vs_base"))}
+        for seg, blk in rep["by_segment"].items():
+            row[f"diff {seg}"] = _ci(blk.get(c, {}).get("log_loss_diff_vs_base"))
+        rows.append(row)
+    parts.append(_table(pd.DataFrame(rows), left=tuple(["model"] + [k for k in rows[0] if k.startswith("diff")])))
+    if rep.get("holdout_confirmation"):
+        h = rep["holdout_confirmation"]["overall"]["p_blend"]
+        parts.append(f"<p>Final-holdout confirmation (one look, nothing refitted): log loss diff vs base "
+                     f"{_ci(h.get('log_loss_diff_vs_base'))}</p>")
+    parts.append(_figs({"b": rep.get("figure")}, {"b": "Log-loss difference vs ML base by season segment (95% CI)"}))
+    return "".join(parts)
+
+
+def _paper_section(con, cfg: dict, out_dir: Path) -> str:
+    pcfg = paper.PaperConfig.from_dict(cfg.get("paper"))
+    s = paper.summarize(con, pcfg, n_boot=300)
+    c = clv.summary(con, pcfg.strategy)
+    parts = [f"<h2>Paper trading <span class='tag'>SIMULATED</span> <span class='tag'>LIVE LEDGER</span></h2>",
+             f"<div class='note'>{_e(s['caveat'])} Strategy {_e(pcfg.strategy)}, book {_e(pcfg.book)}, EV threshold "
+             f"{pcfg.ev_threshold:.0%}, decision {pcfg.decision_min_lead_minutes:.0f}-{pcfg.decision_max_lead_minutes:.0f} "
+             "minutes before tip-off.</div>"]
+    tiles = [("Decisions", sum(s["decisions"].values())), ("Simulated bets", s["n_bets"]),
+             ("Settled / open", f"{s['n_settled']} / {s['n_open']}"),
+             ("Mean est. EV", f"{s['mean_est_ev']:.3f}" if s["mean_est_ev"] is not None else "n/a"),
+             ("Mean edge vs no-vig", f"{s['mean_edge_vs_novig']:.3f}" if s["mean_edge_vs_novig"] is not None else "n/a"),
+             ("Mean price CLV (bets)", f"{s['mean_price_clv']:+.3f}" if s["mean_price_clv"] is not None else "n/a")]
+    if s["status"] == "ok":
+        tiles += [("Win rate", f"{s['win_rate']:.3f}"), ("Flat ROI [95% CI]", _ci(s["flat"]["roi"])),
+                  ("Flat max drawdown", f"{s['flat']['max_drawdown_units']:.2f}u"),
+                  ("Kelly bankroll", f"{s['kelly']['bankroll']:.2f}"),
+                  ("Kelly max drawdown", f"{s['kelly']['max_drawdown_fraction']:.1%}")]
+    parts.append(_tiles(tiles))
+    parts.append(f"<p class='sub'>Decision counts: {_e(s['decisions'])}. CLV status: {_e(c.get('status_counts', {}))}. "
+                 f"{_e(c.get('label', ''))}; positive CLV alone is not proof of profitability.</p>")
+    if s.get("bankroll_history"):
+        fig = plots.paper_bankroll(s["bankroll_history"], out_dir / "paper_bankroll.png", pcfg.initial_bankroll)
+        parts.append(_figs({"b": fig}, {"b": "SIMULATED live paper-trading equity"}))
+    led = paper.ledger(con, pcfg.strategy)
+    if not led.empty:
+        t = pd.DataFrame({"tip-off": led["tipoff_utc"].str[:16], "game": led["game_key"], "decision": led["decision"],
+                          "side": led["side"], "price": led["american_odds"], "p(side)": led["p_side"],
+                          "no-vig": led["market_p_side_novig"], "est. EV": led["est_ev"],
+                          "Kelly stake": led["stake_kelly"], "won": led["won"], "flat P&L": led["pnl_flat"],
+                          "price CLV": led["price_clv"]})
+        parts.append("<h3>Decision ledger (newest first)</h3>" + _table(t.iloc[::-1], left=("tip-off", "game", "decision", "side")))
+    return "".join(parts)
+
+
 def build_dashboard(cfg: dict, out=None) -> str:
     paths = cfg["paths"]
     out = Path(out or paths["dashboard"])
@@ -169,6 +324,9 @@ def build_dashboard(cfg: dict, out=None) -> str:
     runs = pd.read_sql("SELECT model_version, trained_at, reason, train_start, train_end, n_rows FROM training_runs "
                        "ORDER BY trained_at DESC", con)
     alerts = pd.read_sql("SELECT created_at, kind, model_version, message FROM alerts ORDER BY created_at DESC", con)
+    now = pd.Timestamp.now(tz="UTC")
+    phase3 = [_odds_section(con, cfg, now), _market_section(con, cfg), _paper_section(con, cfg, out.parent),
+              _blend_section(cfg)]
     con.close()
 
     parts = [f"<h1>NBA moneyline model</h1><p class='sub'>Research and paper-trading dashboard. Generated "
@@ -210,6 +368,8 @@ def build_dashboard(cfg: dict, out=None) -> str:
     else:
         parts.append("<p class='sub'>No logged upcoming predictions. Run <code>python -m nbamodel predict</code>.</p>")
 
+    parts.extend(phase3[:3])
+
     parts.append("<h2>Historical predictions (live log)</h2>")
     if not hist.empty:
         h = hist.sort_values("game_date", ascending=False).assign(
@@ -223,6 +383,7 @@ def build_dashboard(cfg: dict, out=None) -> str:
     else:
         parts.append("<p class='sub'>No predicted games have results yet.</p>")
 
+    parts.append(phase3[3])
     parts.append(_backtest_section("Backtesting: development walk-forward", Path(paths["walkforward_dir"]),
                                    "Simulated bankroll on development predictions"))
     parts.append(_backtest_section("Backtesting: final holdout", Path(paths["final_test_dir"]),

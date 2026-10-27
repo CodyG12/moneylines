@@ -3,7 +3,8 @@ PY ?= .venv/bin/python
 SEASON ?= 2026-27
 NBA = $(PY) -m nbamodel
 
-.PHONY: test data-fetch data-update dataset walk-forward final-test train predict update-results retrain dashboard daily phase1
+.PHONY: test data-fetch data-update dataset walk-forward final-test train predict update-results retrain dashboard daily phase1 \
+        collect-odds odds-plan odds-status blend-study market-benchmark paper-trade
 
 test:            ## full pytest suite
 	$(PY) -m pytest -q
@@ -41,6 +42,25 @@ dashboard:       ## static HTML dashboard -> out/dashboard/index.html
 	$(NBA) dashboard
 
 daily: data-update retrain predict dashboard  ## typical game-day routine
+
+# ---- Phase 3: odds archive, market benchmark, blending, paper trading (see README) ----
+collect-odds:    ## store an odds snapshot if a scheduled target is due (cron: scripts/collect_odds_cron.sh)
+	$(NBA) collect-odds --then-predict
+
+odds-plan:       ## API credit estimate for the snapshot schedule
+	$(NBA) odds-plan
+
+odds-status:     ## collection runs and per-game snapshot coverage
+	$(NBA) odds-status
+
+blend-study:     ## early-season Elo blending study (development data; one holdout confirmation)
+	$(NBA) blend-study
+
+market-benchmark: ## models vs no-vig market at matching prediction times
+	$(NBA) market-benchmark
+
+paper-trade:     ## due paper decisions + SIMULATED ledger report (never real bets)
+	$(NBA) paper-trade
 
 phase1:          ## original Phase 1 pipeline (unchanged)
 	$(PY) nba_model.py --games data/raw/nba_games.csv --output out/nba/predictions.csv --upcoming-days 3

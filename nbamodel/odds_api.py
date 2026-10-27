@@ -10,6 +10,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -37,8 +40,19 @@ TEAM_CODES = {
 }
 
 
+# Per-call credit cost on The Odds API: markets x regions (current odds); x10 for historical.
+CREDITS_PER_CALL = {"current": 1, "historical": 10}
+RETRY_STATUS = {429, 500, 502, 503, 504}
+
+
 class OddsApiError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+    @property
+    def retryable(self) -> bool:
+        return self.status is None or self.status in RETRY_STATUS
 
 
 def load_api_key(env_file: str | Path = ".env") -> str:
@@ -53,7 +67,7 @@ def load_api_key(env_file: str | Path = ".env") -> str:
     return key
 
 
-def _get(path: str, params: dict, timeout: float = 30.0):
+def _get_once(path: str, params: dict, timeout: float = 30.0):
     url = f"{BASE_URL}{path}?{urllib.parse.urlencode(params)}"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
@@ -61,33 +75,69 @@ def _get(path: str, params: dict, timeout: float = 30.0):
             usage = {h: resp.headers.get(h) for h in ("x-requests-remaining", "x-requests-used", "x-requests-last")}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:300]
-        raise OddsApiError(f"HTTP {exc.code} from The Odds API: {detail}") from exc
+        raise OddsApiError(f"HTTP {exc.code} from The Odds API: {detail}", exc.code) from exc
+    except (urllib.error.URLError, socket.timeout, ConnectionError) as exc:
+        raise OddsApiError(f"network error calling The Odds API: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise OddsApiError(f"invalid JSON from The Odds API: {exc}") from exc
     log.info("odds api usage: %s", usage)
     return body, usage
 
 
-def fetch_current(api_key: str, regions: str = "us", bookmakers: str | None = None):
-    params = {"apiKey": api_key, "regions": regions, "markets": "h2h", "oddsFormat": "decimal",
+def with_retries(call, retries: int = 4, base_delay: float = 2.0, max_delay: float = 60.0, sleep=time.sleep):
+    """Run `call()`, retrying rate limits (429), server errors and network failures with
+    exponential backoff (base_delay * 2**attempt, capped). Auth/quota/validation errors
+    (401, 403, 422, ...) are raised at once: retrying them only burns time."""
+    for attempt in range(retries + 1):
+        try:
+            return call()
+        except OddsApiError as exc:
+            if not exc.retryable or attempt == retries:
+                raise
+            delay = min(max_delay, base_delay * 2 ** attempt)
+            log.warning("odds api attempt %d failed (%s); retrying in %.0fs", attempt + 1, exc, delay)
+            sleep(delay)
+
+
+def _get(path: str, params: dict, timeout: float = 30.0, retries: int = 4, sleep=time.sleep):
+    return with_retries(lambda: _get_once(path, params, timeout), retries=retries, sleep=sleep)
+
+
+def fetch_current(api_key: str, regions: str = "us", bookmakers: str | None = None, odds_format: str = "decimal",
+                  **retry):
+    """Current prices. `observed_at` is our retrieval time: the response is the provider's
+    view at that moment (each market also carries the provider's own `last_update`)."""
+    params = {"apiKey": api_key, "regions": regions, "markets": "h2h", "oddsFormat": odds_format,
               "dateFormat": "iso"}
     if bookmakers:
         params["bookmakers"] = bookmakers
-    body, usage = _get(f"/sports/{SPORT}/odds", params)
+    body, usage = _get(f"/sports/{SPORT}/odds", params, **retry)
     observed_at = pd.Timestamp.now(tz="UTC").isoformat()
-    return parse_events(body, observed_at), usage
+    return parse_events(body, observed_at, odds_format), usage
 
 
-def fetch_historical(api_key: str, at_iso: str, regions: str = "us", bookmakers: str | None = None):
+def fetch_historical(api_key: str, at_iso: str, regions: str = "us", bookmakers: str | None = None,
+                     odds_format: str = "decimal", **retry):
     """Snapshot as of `at_iso` (paid plans only). The snapshot's own timestamp,
     which is at or before `at_iso`, becomes `observed_at`."""
-    params = {"apiKey": api_key, "regions": regions, "markets": "h2h", "oddsFormat": "decimal",
+    params = {"apiKey": api_key, "regions": regions, "markets": "h2h", "oddsFormat": odds_format,
               "dateFormat": "iso", "date": at_iso}
     if bookmakers:
         params["bookmakers"] = bookmakers
-    body, usage = _get(f"/historical/sports/{SPORT}/odds", params)
-    return parse_events(body.get("data", []), body["timestamp"]), usage
+    body, usage = _get(f"/historical/sports/{SPORT}/odds", params, **retry)
+    return parse_events(body.get("data", []), body["timestamp"], odds_format), usage
 
 
-def parse_events(events: list, observed_at: str) -> pd.DataFrame:
+def fetch_events(api_key: str, **retry):
+    """Upcoming NBA events (ids, teams, commence times). Costs no credits."""
+    return _get(f"/sports/{SPORT}/events", {"apiKey": api_key, "dateFormat": "iso"}, **retry)
+
+
+def parse_events(events: list, observed_at: str, odds_format: str = "decimal") -> pd.DataFrame:
+    """Flatten provider events. With odds_format="american" the quoted American prices are
+    kept (home_american/away_american) and home_price/away_price hold exact decimal conversions."""
+    from .odds import american_to_decimal
+    american = odds_format == "american"
     rows, unknown = [], set()
     for ev in events:
         home_name, away_name = ev.get("home_team"), ev.get("away_team")
@@ -102,13 +152,24 @@ def parse_events(events: list, observed_at: str) -> pd.DataFrame:
                 prices = {o["name"]: o["price"] for o in market.get("outcomes", [])}
                 if home_name not in prices or away_name not in prices:
                     continue
-                rows.append({
+                row = {
                     "observed_at": observed_at, "event_id": ev["id"], "commence_time": ev["commence_time"],
                     "home_team": home_code, "away_team": away_code, "home_name": home_name,
                     "away_name": away_name, "book": book["key"],
                     "market_last_update": market.get("last_update", book.get("last_update")),
-                    "home_price": float(prices[home_name]), "away_price": float(prices[away_name]),
-                })
+                }
+                if american:
+                    try:
+                        h, a = float(prices[home_name]), float(prices[away_name])
+                        row.update(home_american=h, away_american=a, home_price=float(american_to_decimal(h)),
+                                   away_price=float(american_to_decimal(a)))
+                    except (TypeError, ValueError):
+                        row.update(home_american=prices[home_name], away_american=prices[away_name],
+                                   home_price=float("nan"), away_price=float("nan"))
+                else:
+                    row.update(home_price=float(prices[home_name]), away_price=float(prices[away_name]))
+                rows.append(row)
     if unknown:
         log.warning("skipped events with unrecognised team names: %s", sorted(unknown))
-    return pd.DataFrame(rows, columns=SNAPSHOT_COLUMNS)
+    cols = SNAPSHOT_COLUMNS + (["home_american", "away_american"] if american else [])
+    return pd.DataFrame(rows, columns=cols)

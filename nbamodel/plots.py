@@ -186,3 +186,49 @@ def bankroll_curve(bets: pd.DataFrame, path, initial: float):
                          label="Fractional Kelly drawdown")
     axes[1].set(ylabel="Drawdown, %", title="Fractional Kelly drawdown from peak")
     return _save(fig, path)
+
+
+BLEND_COLORS = {"p_elo": COLORS["p_elo"], "p_blend_fixed": "#6250d6", "p_blend_games_played": "#1baf7a",
+                "p_blend_season_phase": "#eda100", "p_blend_decay": "#008300", "p_blend_early_only": "#e87ba4"}
+
+
+def blend_by_segment(report: dict, path):
+    """Paired log-loss difference vs the ML base, by season segment, with 95% date-clustered CIs.
+    Dots left of zero mean the blend (or Elo alone) beat the ML model in that segment."""
+    plt = _plt()
+    segs = list(report["by_segment"])
+    cols = [c for c in BLEND_COLORS if c in report["overall"]]
+    fig, axes = plt.subplots(1, len(segs), figsize=(3.6 * len(segs), 0.42 * len(cols) + 1.6), sharey=True)
+    for ax, seg in zip(np.atleast_1d(axes), segs):
+        blk = report["by_segment"][seg]
+        y = np.arange(len(cols))
+        for yi, c in zip(y, cols):
+            d = blk.get(c, {}).get("log_loss_diff_vs_base")
+            if not d:
+                continue
+            ax.plot([d["ci_low"], d["ci_high"]], [yi, yi], color=BLEND_COLORS[c], lw=2)
+            ax.plot(d["estimate"], yi, "o", ms=7, color=BLEND_COLORS[c], markeredgecolor=SURFACE, markeredgewidth=2)
+        ax.axvline(0, color=INK2, lw=0.8)
+        n = blk.get(report["base_col"], {}).get("n", 0)
+        ax.set_title(f"{seg}, n={n}")
+        ax.set_xlabel("Log loss minus ML base")
+        ax.set_yticks(y, [c.replace("p_blend_", "blend: ").replace("p_elo", "Elo alone") for c in cols])
+    np.atleast_1d(axes)[0].invert_yaxis()
+    fig.suptitle("Elo blending vs ML model, out-of-sample by season segment (left of 0 = better)", fontsize=11,
+                 fontweight="bold")
+    return _save(fig, path)
+
+
+def paper_bankroll(history: list, path, initial: float):
+    """Live SIMULATED paper-trading equity: flat units and fractional-Kelly bankroll, one panel each."""
+    plt = _plt()
+    h = pd.DataFrame(history)
+    t = pd.to_datetime(h["tipoff_utc"])
+    fig, axes = plt.subplots(2, 1, figsize=(8, 5), sharex=True)
+    axes[0].plot(t, h["flat_cum"], color=COLORS["p_elo"], marker="o", ms=3)
+    axes[0].axhline(0, color=INK2, lw=0.8)
+    axes[0].set(title="SIMULATED live paper trading: flat 1-unit stakes", ylabel="Cumulative profit, units")
+    axes[1].plot(t, h["kelly_bankroll"], color=COLORS["p_logistic"], marker="o", ms=3)
+    axes[1].axhline(initial, color=INK2, lw=0.8)
+    axes[1].set(title="Fractional-Kelly bankroll", ylabel="Bankroll")
+    return _save(fig, path)
