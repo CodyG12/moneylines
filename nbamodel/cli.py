@@ -730,7 +730,7 @@ def cmd_today(args, cfg):
                                    model_version=preds["model_version"].iloc[0])
     out = Path(args.out or f"out/today/predictions_{target.date()}.csv")
     out.parent.mkdir(parents=True, exist_ok=True)
-    preds.to_csv(out, index=False, float_format="%.6f")
+    with_winner(preds).to_csv(out, index=False, float_format="%.6f")
 
     # 3) report
     t = meta["training"]
@@ -789,6 +789,17 @@ def cmd_today(args, cfg):
     print("Paper decisions for later tip-offs are made by the scheduled collector 30-90 min before tip-off. "
           "No real bets are placed.")
     return 0
+
+
+def with_winner(preds: pd.DataFrame) -> pd.DataFrame:
+    """Add predicted_winner (team with p >= 0.5, home on an exact tie) and its probability as the first
+    columns after the game identifiers."""
+    home = preds["p_home"] >= 0.5
+    out = preds.copy()
+    at = list(out.columns).index("away_team") + 1 if "away_team" in out else 0
+    out.insert(at, "predicted_winner", np.where(home, out["home_team"], out["away_team"]))
+    out.insert(at + 1, "predicted_winner_prob", np.where(home, out["p_home"], out["p_away"]))
+    return out
 
 
 def _markdown(df: pd.DataFrame) -> str:

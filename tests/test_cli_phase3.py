@@ -128,3 +128,13 @@ def test_weekly_report_from_stored_records(env, capsys):
     text = (d / "weekly.md").read_text()
     for section in ("Prediction accuracy", "Calibration", "Model vs market", "Paper trading", "Data collection"):
         assert section in text
+
+
+def test_today_csv_winner_columns():
+    df = pd.DataFrame({"game_key": ["a", "b", "c"], "home_team": ["BOS", "NYK", "LAL"],
+                       "away_team": ["BKN", "DET", "POR"], "p_home": [0.835, 0.386, 0.5],
+                       "p_away": [0.165, 0.614, 0.5]})
+    out = cli.with_winner(df)
+    assert list(out.columns[:5]) == ["game_key", "home_team", "away_team", "predicted_winner", "predicted_winner_prob"]
+    assert list(out["predicted_winner"]) == ["BOS", "DET", "LAL"]
+    assert list(out["predicted_winner_prob"]) == [0.835, 0.614, 0.5]
