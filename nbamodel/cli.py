@@ -9,6 +9,15 @@
   update-results   reconcile results, update metrics/Elo, detect degradation, retrain if due
   dashboard        build the static HTML dashboard
 
+Phase 3 (odds, market benchmark, blending, paper trading):
+  collect-odds     store a timestamped odds snapshot when a scheduled target is due (run from cron)
+  odds-plan        API credit estimate for the snapshot schedule
+  odds-status      collection runs and per-game snapshot coverage
+  import-odds      import an odds CSV into the snapshot archive
+  blend-study      early-season Elo blending, weights chosen on earlier seasons only
+  market-benchmark models vs the no-vig market at matching prediction times
+  paper-trade      paper decisions and the simulated ledger (never real bets)
+
 Settings come from config/phase2.json (override with --config); paths can be
 overridden per command. Secrets (ODDS_API_KEY) come from the environment or .env.
 """
@@ -25,7 +34,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import plots, registry, store
+from . import blend, clv, market, odds_collect, odds_schedule, odds_store, paper, plots, registry, store
 from .backtest import BettingConfig, paper_trade
 from .data import DataError, prepare_games
 from .dataset import DatasetConfig, build_training_dataset
@@ -74,7 +83,13 @@ def load_games_from(cfg: dict, games_path=None, odds_path=None, book=None):
         raw = pd.read_csv(games_path, comment="#", dtype={"game_id_source": str})
     except FileNotFoundError as exc:
         raise DataError(f"games file not found: {games_path}") from exc
-    if odds_path:
+    if odds_path == "db":  # snapshots archived by collect-odds (pregame, matched rows only)
+        with store.connect(cfg["paths"]["db"]) as con:
+            snaps = odds_store.as_join_frame(odds_store.load_snapshots(con))
+        if not snaps.empty:
+            raw = attach_odds_with_close(raw, snaps, book=book or cfg["paths"]["book"],
+                                         lead_minutes=cfg["dataset"]["lead_minutes"])
+    elif odds_path:
         try:
             snaps = pd.read_csv(odds_path)
         except FileNotFoundError as exc:
@@ -297,48 +312,138 @@ def cmd_train(args, cfg):
     return 0
 
 
+def _uses_odds_db(args, cfg) -> bool:
+    return (args.odds or cfg["paths"].get("odds")) == "db"
+
+
+def _add_shadow_blend(preds: pd.DataFrame, games: pd.DataFrame, cfg) -> pd.DataFrame:
+    """p_blend from the stored blend study (shadow: logged for evaluation, published only if enabled)."""
+    path = Path(cfg["paths"].get("blend", "artifacts/blend.json"))
+    if preds.empty or not path.exists():
+        return preds
+    b = json.loads(path.read_text())
+    if b["base_col"] not in preds or "p_elo" not in preds:
+        return preds
+    first = games.groupby("season")["date"].min()
+    preds = preds.assign(season_day=(pd.to_datetime(preds["date"]) - preds["season"].map(first)).dt.days)
+    preds["p_blend"] = blend.apply(preds, b["final_params"], b["base_col"])
+    if b.get("enabled"):
+        log.warning("blend %s is enabled; publishing p_blend as p_home", b["blend_id"])
+        preds["p_home"], preds["p_away"] = preds["p_blend"], 1 - preds["p_blend"]
+        preds["model_version"] = preds["model_version"] + "+" + b["blend_id"]
+    return preds.drop(columns="season_day")
+
+
 def cmd_predict(args, cfg):
-    games, _, _ = load_games_from(cfg, args.games, args.odds, args.book)
+    use_db = _uses_odds_db(args, cfg)
+    games, _, _ = load_games_from(cfg, args.games, None if use_db else args.odds, args.book)
     model, meta = registry.load_model(args.version, cfg["paths"]["artifacts"])
     now = pd.Timestamp(args.as_of, tz="UTC") if args.as_of else None
     preds = predict_upcoming(games, model, meta, args.days or cfg["predict"]["horizon_days"], now)
     if preds.empty:
         print("no upcoming scheduled games in the data (run scripts/update_schedule.py)")
         return 0
-    out = Path(args.out or cfg["paths"]["upcoming"])
-    out.parent.mkdir(parents=True, exist_ok=True)
-    preds.to_csv(out, index=False, float_format="%.6f")
+    preds = _add_shadow_blend(preds, games, cfg)
+    book = args.book or cfg["paths"]["book"]
+    quotes = None
     with store.connect(cfg["paths"]["db"]) as con:
+        if use_db:  # prices as of this prediction's own timestamp, never later
+            preds, quotes = market.attach_market_asof(preds, odds_store.load_snapshots(con), book,
+                                                      cfg.get("odds", {}).get("max_age_minutes", 120))
+        out = Path(args.out or cfg["paths"]["upcoming"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        preds.to_csv(out, index=False, float_format="%.6f")
         n = store.log_predictions(con, preds)
+        n_q = store.log_prediction_odds(con, preds, quotes)
+        decided = pd.DataFrame()
+        pcfg = cfg.get("paper", {})
+        if pcfg.get("enabled") and not args.as_of:
+            decided = paper.decide(con, paper.PaperConfig.from_dict(pcfg), model_version=preds["model_version"].iloc[0])
     print(f"model {meta['version']}; data through {preds['latest_result_in_data'].iloc[0]}")
     print(f"{'date':<11} {'game':<11} {'p(home)':>7} {'fair':>11} {'spread':>6}  market / notes")
     for _, r in preds.iterrows():
         line = (f"{r['date'].date()!s:<11} {r['away_team']:>3} @ {r['home_team']:<3}  {r['p_home']:>7.3f} "
                 f"{r['fair_home_american']:+5d}/{r['fair_away_american']:+5d} {r['model_spread']:>6.3f}")
         if pd.notna(r["home_odds"]):
-            line += f"  book {r['home_odds']:.2f}/{r['away_odds']:.2f} no-vig {r['market_home_prob_novig']:.3f}"
+            line += (f"  {r['odds_book']} {r['home_odds']:.2f}/{r['away_odds']:.2f} no-vig "
+                     f"{r['market_home_prob_novig']:.3f} edge {r['edge_home']:+.3f}")
+        elif use_db:
+            line += "  [no price at prediction time]"
         if r["low_history"]:
             line += "  [low history]"
         print(line)
-    print(f"\nlogged {n} new predictions to {cfg['paths']['db']}; wrote {out}")
+    print(f"\nlogged {n} new predictions ({n_q} book prices recorded with them) to {cfg['paths']['db']}; wrote {out}")
+    if not decided.empty:
+        print("paper decisions (SIMULATED, no real bets): " + ", ".join(
+            f"{k} {v}" for k, v in decided["decision"].value_counts().items()))
     print("Fair odds are the model's zero-margin prices, not bookmaker prices. A positive estimated edge is "
           "not a guarantee of profit.")
     return 0
 
 
+def data_quality(con, games: pd.DataFrame, cfg, now: pd.Timestamp, days: int = 3) -> list:
+    """Missing-data checks over games that tipped off in the last `days` days."""
+    book = cfg.get("paper", {}).get("book", cfg["paths"]["book"])
+    tip = pd.to_datetime(games["tipoff_utc"], utc=True, errors="coerce")
+    recent = games[(tip <= now) & (tip >= now - pd.Timedelta(days=days))]
+    issues = []
+    if recent.empty:
+        return issues
+    keys = set(recent["game_key"])
+    snap = odds_store.load_snapshots(con, book=book)
+    no_odds = sorted(keys - set(snap["game_key"]))
+    if no_odds:
+        issues.append(f"{len(no_odds)} of {len(keys)} recent games have no pregame {book} snapshot")
+    preds = pd.read_sql("SELECT DISTINCT game_key FROM predictions", con)
+    no_pred = sorted(keys - set(preds["game_key"]))
+    if no_pred:
+        issues.append(f"{len(no_pred)} of {len(keys)} recent games were never predicted")
+    dec = pd.read_sql("SELECT game_key FROM paper_decisions", con)
+    if cfg.get("paper", {}).get("enabled"):
+        no_dec = sorted((keys - set(no_pred)) - set(dec["game_key"]))
+        if no_dec:
+            issues.append(f"{len(no_dec)} predicted recent games have no paper decision (no prediction inside "
+                          "the decision window)")
+    errs = con.execute("SELECT COUNT(*) FROM odds_collection_runs WHERE status='error' AND started_at >= ?",
+                       ((now - pd.Timedelta(days=1)).isoformat(),)).fetchone()[0]
+    if errs:
+        issues.append(f"{errs} odds collection run(s) failed in the last 24h")
+    for msg in issues:
+        seen = con.execute("SELECT 1 FROM alerts WHERE kind='data_quality' AND message=? AND created_at >= ?",
+                           (msg, (now - pd.Timedelta(hours=20)).isoformat())).fetchone()
+        if not seen:
+            con.execute("INSERT INTO alerts (created_at, kind, model_version, message, details_json) "
+                        "VALUES (?,?,?,?,?)", (now.isoformat(), "data_quality", None, msg, None))
+    con.commit()
+    return issues
+
+
 def cmd_update_results(args, cfg):
     games, _, games_path = load_games_from(cfg, args.games, args.odds, args.book)
     fb = cfg["feedback"]
+    now = pd.Timestamp.now(tz="UTC")
     with store.connect(cfg["paths"]["db"]) as con:
+        remapped = odds_store.remap_unmatched(con, games)
         rec = store.reconcile(con, games)
         metrics = store.snapshot_metrics(con)
         _, ratings = compute_elo(games, ds_config(cfg).elo)
         store.snapshot_elo(con, ratings)
         print(f"results recorded for {rec['results_recorded']} predicted games; scored {rec['predictions_scored']} "
               f"predictions ({rec['late_predictions']} made after tip-off, excluded from metrics)")
+        if remapped:
+            print(f"matched {remapped} previously unmatched odds snapshots to games")
         if not metrics.empty:
             print(metrics[["model_version", "window", "n", "log_loss", "brier", "accuracy", "ece"]]
                   .to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+        pcfg = paper.PaperConfig.from_dict(cfg.get("paper"))
+        settled = paper.resolve(con, now)
+        n_clv = clv.record(con, pcfg.close_window_minutes, now)
+        mkt = market.snapshot_market_metrics(con, pcfg.book, now)
+        print(f"paper ledger: settled {settled} decisions; CLV computed for {n_clv}"
+              + (f"; market ({pcfg.book}) log loss {mkt['log_loss'].iloc[0]:.4f} on {int(mkt['n'].iloc[0])} "
+                 "aligned games" if not mkt.empty else ""))
+        for msg in data_quality(con, games, cfg, now):
+            print(f"data check: {msg}")
         version = registry.active_version(cfg["paths"]["artifacts"])
         degradation, reason = None, None
         if version:
@@ -360,6 +465,213 @@ def cmd_update_results(args, cfg):
               "with the same validated configuration, not from adjustments to individual results.")
     elif reason:
         print(f"retraining is due ({reason}); rerun with --retrain-if-due or run `train`")
+    return 0
+
+
+# ------------------------------------------------------------------ Phase 3 commands
+def _schedule(cfg) -> odds_schedule.ScheduleConfig:
+    return odds_schedule.ScheduleConfig.from_dict(cfg.get("odds", {}).get("schedule"))
+
+
+def _provider(args, cfg):
+    if getattr(args, "from_file", None):
+        if not args.observed_at:
+            raise DataError("--from-file needs --observed-at (the time the saved response was observed)")
+        return odds_collect.FileProvider(args.from_file, args.observed_at, args.file_format)
+    from .odds_api import OddsApiError, load_api_key
+    o = cfg.get("odds", {})
+    try:
+        key = load_api_key()
+    except OddsApiError as exc:
+        raise DataError(f"{exc}. Get a free key at https://the-odds-api.com and put ODDS_API_KEY=... in .env") from exc
+    return odds_collect.TheOddsApi(key, o.get("regions", "us"), o.get("bookmakers"), o.get("retries", 4))
+
+
+def cmd_collect_odds(args, cfg):
+    games, _, _ = load_games_from(cfg, args.games, None)
+    provider = _provider(args, cfg)
+    now = pd.Timestamp(args.observed_at) if getattr(args, "from_file", None) else None
+    with store.connect(cfg["paths"]["db"]) as con:
+        res = odds_collect.collect(con, provider, games, _schedule(cfg), now=now, force=args.force,
+                                   budget_guard=not args.no_budget_guard)
+    if res["status"] == "skipped":
+        print(f"no snapshot due (offsets in use: {res['offsets_in_use']}); nothing fetched, no credits used")
+        return 0
+    if res["status"] == "error":
+        print(f"error: odds collection failed and was logged (run {res['run_id']}): {res['error']}", file=sys.stderr)
+        return 3
+    usage = res.get("usage") or {}
+    print(f"run {res['run_id']}: {res['n_events']} events, {res['n_rows']} book prices -> {res['n_inserted']} stored, "
+          f"{res['n_duplicates']} duplicates, {res['n_invalid']} invalid, {res['n_unmatched']} unmatched, "
+          f"{res['n_live']} in-game (kept, never used); {res['targets_due']} target(s) due; "
+          f"credits used {usage.get('x-requests-last')}, remaining {usage.get('x-requests-remaining')}")
+    if res.get("due_games_without_prices"):
+        print(f"warning: no prices for {len(res['due_games_without_prices'])} game(s) with due targets")
+    if args.then_predict and res["n_inserted"]:
+        ns = argparse.Namespace(games=args.games, odds=None, book=None, days=None, version=None, out=None,
+                                as_of=None)
+        return cmd_predict(ns, cfg)
+    return 0
+
+
+def cmd_odds_plan(args, cfg):
+    games, _, _ = load_games_from(cfg, args.games, None)
+    sc = _schedule(cfg)
+    up = games[~games["played"]]
+    start = pd.Timestamp(args.start, tz="UTC") if args.start else pd.Timestamp.now(tz="UTC")
+    tip = pd.to_datetime(up["tipoff_utc"], utc=True, errors="coerce")
+    if tip.notna().sum() == 0:
+        print("no upcoming games with tip-off times (run scripts/update_schedule.py); nothing to plan")
+        return 0
+    end = pd.Timestamp(args.end, tz="UTC") if args.end else tip.max()
+    print(f"schedule: {up['tipoff_utc'].notna().sum()} upcoming games with tip-off times; window {start:%Y-%m-%d} to "
+          f"{end:%Y-%m-%d}; poll every {sc.poll_minutes} min; {sc.credits_per_call} credit/call; budget "
+          f"{sc.monthly_credit_budget}/month (reserve {sc.reserve_credits})")
+    offsets = list(sc.offsets_minutes)
+    for k in range(len(offsets), 0, -1):
+        keep = tuple(o for o in sc.offsets_minutes if o in sc.priority[:k])
+        p = odds_schedule.plan(up, sc, start, end, keep)
+        fits = p["max_calls_per_month"] * sc.credits_per_call <= sc.monthly_credit_budget - sc.reserve_credits
+        print(f"  offsets {str(list(keep)):<22} calls {p['n_calls']:>5}  per 30 days {p['credits_per_30_days']:>6}  "
+              f"busiest month {p['max_calls_per_month']:>4}  {'fits' if fits else 'OVER BUDGET'}")
+    p = odds_schedule.plan(up, sc, start, end)
+    print("calls by month (all offsets): " + ", ".join(f"{k} {v}" for k, v in p["calls_by_month"].items()))
+    return 0
+
+
+def cmd_odds_status(args, cfg):
+    games, _, _ = load_games_from(cfg, args.games, None)
+    now = pd.Timestamp.now(tz="UTC")
+    with store.connect(cfg["paths"]["db"]) as con:
+        runs = pd.read_sql("SELECT id, started_at, status, reason, n_events, n_inserted, n_invalid, n_unmatched, "
+                           "n_live, credits_remaining, error FROM odds_collection_runs ORDER BY id DESC LIMIT 15", con)
+        cov = odds_collect.coverage(con, games, _schedule(cfg), cfg.get("odds", {}).get("provider", "the-odds-api"),
+                                    now - pd.Timedelta(days=args.days), now + pd.Timedelta(days=2))
+        n = con.execute("SELECT COUNT(*), COUNT(DISTINCT game_key), MIN(observed_at), MAX(observed_at) "
+                        "FROM odds_snapshots").fetchone()
+    print(f"snapshot rows {n[0]} covering {n[1]} games; observed {n[2]} to {n[3]}")
+    print("\nrecent collection runs:")
+    print(runs.to_string(index=False) if not runs.empty else "  none yet")
+    print("\ngame coverage:")
+    print(cov.to_string(index=False) if not cov.empty else "  no games in range")
+    return 0
+
+
+def cmd_import_odds(args, cfg):
+    """Import an odds CSV in the scripts/collect_odds.py layout into the snapshot archive."""
+    rows = pd.read_csv(args.csv, dtype={"event_id": str})
+    need = {"observed_at", "event_id", "commence_time", "home_team", "away_team", "book", "home_price", "away_price"}
+    if not need <= set(rows.columns):
+        raise DataError(f"odds CSV needs columns {sorted(need)}")
+    games, _, _ = load_games_from(cfg, args.games, None)
+    frame = odds_store.from_provider_frame(rows, args.provider, f"import:{Path(args.csv).name}",
+                                           pd.Timestamp.now(tz="UTC").isoformat())
+    with store.connect(cfg["paths"]["db"]) as con:
+        run = odds_store.start_run(con, args.provider, "import")
+        counts = odds_store.store_snapshots(con, frame, games, run)
+        odds_store.finish_run(con, run, "ok", counts, reason=f"import {args.csv}")
+    print(f"imported {counts['n_inserted']} of {counts['n_rows']} rows ({counts['n_duplicates']} duplicates, "
+          f"{counts['n_invalid']} invalid {counts['invalid_reasons']}, {counts['n_unmatched']} unmatched, "
+          f"{counts['n_live']} in-game)")
+    return 0
+
+
+def cmd_blend_study(args, cfg):
+    ev = cfg["evaluation"]
+    base = args.base or cfg.get("blend", {}).get("base_col", "p_logistic_raw")
+    dev_path = Path(cfg["paths"]["walkforward_dir"]) / "predictions.csv"
+    if not dev_path.exists():
+        raise DataError("run `walk-forward` first: the blend study uses development walk-forward predictions")
+    st = blend.study(pd.read_csv(dev_path), base, ev["n_boot"], ev["seed"])
+    rep = st.report
+    hold = Path(cfg["paths"]["final_test_dir"]) / "predictions.csv"
+    if args.confirm_holdout and hold.exists():
+        rep["holdout_confirmation"] = blend.confirm_on_holdout(pd.read_csv(hold), rep["final_params"], base,
+                                                               ev["n_boot"], ev["seed"])
+        log_path = Path(cfg["paths"]["final_test_log"])
+        with open(log_path, "a") as fh:
+            fh.write(json.dumps({"run_at": pd.Timestamp.now(tz="UTC").isoformat(), "kind": "blend_confirmation",
+                                 "blend_id": rep["blend_id"], "params": rep["final_params"]}) + "\n")
+    outdir = Path(args.out or cfg["paths"].get("blend_dir", "out/blend"))
+    outdir.mkdir(parents=True, exist_ok=True)
+    st.oos.to_csv(outdir / "oos_predictions.csv", index=False, float_format="%.6f")
+    rep["figure"] = plots.blend_by_segment(rep, outdir / "blend_by_segment.png")
+    _write_json(outdir / "report.json", rep)
+    _write_json(cfg["paths"].get("blend", "artifacts/blend.json"),
+                {k: rep[k] for k in ("blend_id", "base_col", "best_method", "final_params", "enabled", "decision_rule",
+                                     "evaluated_seasons")})
+    print(f"Elo blend study (base {base}); weights chosen on earlier seasons only, scored on seasons "
+          f"{rep['evaluated_seasons'][0]}-{rep['evaluated_seasons'][-1]} ({rep['n']} games)")
+    print(f"{'model':<24} {'log loss':>9} {'diff vs base [95% CI]':>32}   early-season diff [95% CI]")
+    early = rep["by_segment"].get("early (<15 games)", {})
+    for c, v in rep["overall"].items():
+        d = v.get("log_loss_diff_vs_base")
+        e = early.get(c, {}).get("log_loss_diff_vs_base")
+        print(f"{c:<24} {v['log_loss']:>9.4f} {fmt_ci_short(d):>32}   {fmt_ci_short(e)}")
+    print(f"best method: {rep['best_method']} {rep['final_params']}; ENABLED: {rep['enabled']}")
+    print(f"rule: {rep['decision_rule']}. {rep['multiple_testing_note']}.")
+    if rep.get("holdout_confirmation"):
+        h = rep["holdout_confirmation"]["overall"]["p_blend"]["log_loss_diff_vs_base"]
+        print(f"holdout confirmation (one look, nothing refitted): diff {fmt_ci_short(h)}")
+    print(f"wrote {outdir}/ and {cfg['paths'].get('blend', 'artifacts/blend.json')}")
+    return 0
+
+
+def fmt_ci_short(d) -> str:
+    if not d:
+        return "-"
+    return f"{d['estimate']:+.4f} [{d['ci_low']:+.4f}, {d['ci_high']:+.4f}]"
+
+
+def cmd_market_benchmark(args, cfg):
+    ev = cfg["evaluation"]
+    book = args.book or cfg.get("paper", {}).get("book", cfg["paths"]["book"])
+    with store.connect(cfg["paths"]["db"]) as con:
+        live = market.live_benchmark(con, book, ev["n_boot"], ev["seed"])
+    out = {"live": live}
+    ft = Path(cfg["paths"]["final_test_dir"]) / "predictions.csv"
+    if ft.exists():
+        hp = pd.read_csv(ft, parse_dates=["date"])
+        if "market_home_prob_novig" in hp and hp["market_home_prob_novig"].notna().any():
+            out["final_test_backtest"] = market.benchmark(hp.rename(columns={"market_home_prob_novig": "p_market"})
+                                                          .assign(home_win=hp["home_win"]), ev["n_boot"], ev["seed"])
+    outdir = Path(args.out or "out/market")
+    _write_json(outdir / "report.json", out)
+    print(f"Model vs market (no-vig, proportional), book {book}. Each model is compared with the price recorded "
+          "at its own prediction time.")
+    for h, r in live["by_horizon"].items():
+        if r.get("status") != "ok":
+            print(f"  {h:>7}: {r.get('status')} (n={r.get('n', 0)})")
+            continue
+        print(f"  {h:>7}: n={r['n']}{' PRELIMINARY' if r['preliminary'] else ''}  market log loss "
+              f"{r['market']['log_loss']:.4f}, Brier {r['market']['brier']:.4f}, acc {r['market']['accuracy']:.3f}")
+        for c, s in r["models"].items():
+            print(f"           {c:<15} log loss {s['log_loss']:.4f}  minus market {fmt_ci_short(s['log_loss_minus_market'])}")
+    if "final_test_backtest" in out:
+        print(f"final-test backtest games with archived odds: n={out['final_test_backtest'].get('n')}")
+    print(f"wrote {outdir}/report.json")
+    return 0
+
+
+def cmd_paper_trade(args, cfg):
+    pcfg = paper.PaperConfig.from_dict(cfg.get("paper"))
+    with store.connect(cfg["paths"]["db"]) as con:
+        now = pd.Timestamp(args.now, tz="UTC") if args.now else None
+        decided = paper.decide(con, pcfg, now=now) if not args.report_only else pd.DataFrame()
+        s = paper.summarize(con, pcfg, cfg["evaluation"]["n_boot"], cfg["evaluation"]["seed"])
+        c = clv.summary(con, pcfg.strategy)
+    if not decided.empty:
+        print("new decisions: " + ", ".join(f"{k} {v}" for k, v in decided["decision"].value_counts().items()))
+    print(f"PAPER TRADING (simulated, strategy {s['strategy']}, book {s['book']}): decisions {s['decisions']}")
+    print(f"bets {s['n_bets']} (settled {s['n_settled']}, open {s['n_open']}); mean est. EV {s['mean_est_ev']}; "
+          f"mean edge vs no-vig {s['mean_edge_vs_novig']}")
+    if s["status"] == "ok":
+        print(f"win rate {s['win_rate']:.3f} vs break-even {s['mean_break_even']:.3f}; flat ROI "
+              f"{fmt_ci_short(s['flat']['roi'])}; flat max drawdown {s['flat']['max_drawdown_units']:.2f}u; "
+              f"Kelly bankroll {s['kelly']['bankroll']:.2f} (max drawdown {s['kelly']['max_drawdown_fraction']:.1%})"
+              + ("  PRELIMINARY" if s["preliminary"] else ""))
+    print(f"{c.get('label')}: {c.get('bets', {})} status {c.get('status_counts', {})}")
+    print(s["caveat"])
     return 0
 
 
@@ -405,12 +717,45 @@ def build_parser():
     up = common(sub.add_parser("update-results", help="reconcile results and monitor"))
     up.add_argument("--retrain-if-due", action="store_true")
     sub.add_parser("dashboard", help="build the HTML dashboard").add_argument("--out")
+
+    co = sub.add_parser("collect-odds", help="store an odds snapshot if a scheduled target is due")
+    co.add_argument("--games")
+    co.add_argument("--force", action="store_true", help="fetch even if no target is due (uses a credit)")
+    co.add_argument("--no-budget-guard", action="store_true", help="keep all offsets even if over budget")
+    co.add_argument("--then-predict", action="store_true", help="run `predict` after a successful fetch")
+    co.add_argument("--from-file", help="replay a saved provider JSON response instead of calling the API")
+    co.add_argument("--observed-at", help="observation time (UTC ISO) of --from-file data")
+    co.add_argument("--file-format", default="decimal", choices=["decimal", "american"])
+    op = sub.add_parser("odds-plan", help="estimate API credit use for the collection schedule")
+    op.add_argument("--games")
+    op.add_argument("--start")
+    op.add_argument("--end")
+    os_ = sub.add_parser("odds-status", help="collection runs and per-game snapshot coverage")
+    os_.add_argument("--games")
+    os_.add_argument("--days", type=int, default=3)
+    io = sub.add_parser("import-odds", help="import an odds snapshot CSV into the archive")
+    io.add_argument("--csv", required=True)
+    io.add_argument("--games")
+    io.add_argument("--provider", default="the-odds-api")
+    bs = sub.add_parser("blend-study", help="early-season Elo blending study on development predictions")
+    bs.add_argument("--base", help="ML probability column (default from config)")
+    bs.add_argument("--confirm-holdout", action="store_true", help="score the chosen blend once on the final holdout")
+    bs.add_argument("--out")
+    mb = sub.add_parser("market-benchmark", help="models vs no-vig market at matching prediction times")
+    mb.add_argument("--book")
+    mb.add_argument("--out")
+    pt = sub.add_parser("paper-trade", help="make due paper decisions and report the simulated ledger")
+    pt.add_argument("--report-only", action="store_true")
+    pt.add_argument("--now", help="decision clock (UTC ISO) for replaying logged predictions; default now")
     return p
 
 
 COMMANDS = {"build-dataset": cmd_build_dataset, "walk-forward": cmd_walk_forward, "final-test": cmd_final_test,
             "evaluate": cmd_evaluate, "train": cmd_train, "predict": cmd_predict,
-            "update-results": cmd_update_results, "dashboard": cmd_dashboard}
+            "update-results": cmd_update_results, "dashboard": cmd_dashboard,
+            "collect-odds": cmd_collect_odds, "odds-plan": cmd_odds_plan, "odds-status": cmd_odds_status,
+            "import-odds": cmd_import_odds, "blend-study": cmd_blend_study, "market-benchmark": cmd_market_benchmark,
+            "paper-trade": cmd_paper_trade}
 
 
 def main(argv=None) -> int:

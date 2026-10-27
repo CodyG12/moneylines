@@ -158,6 +158,8 @@ def _bet_extras(bets: pd.DataFrame) -> pd.DataFrame:
             side_close = np.where(c["side"] == "home", c["close_home_odds"], c["close_away_odds"])
             other_close = np.where(c["side"] == "home", c["close_away_odds"], c["close_home_odds"])
             bets.loc[closed, "clv"] = closing_line_value(c["odds"], side_close, other_close)
+            # price-based CLV (same book): decision decimal / closing decimal - 1
+            bets.loc[closed, "price_clv"] = c["odds"].to_numpy() / side_close - 1
     return bets
 
 
@@ -190,7 +192,12 @@ def paper_trade(preds: pd.DataFrame, p_col: str, config: BettingConfig = Betting
     summary["mean_overround"] = float(overround(bets["home_odds"], bets["away_odds"]).mean())
     if "clv" in bets and bets["clv"].notna().any():
         summary["clv"] = {"n": int(bets["clv"].notna().sum()), "mean": float(bets["clv"].mean()),
-                          "share_positive": float((bets["clv"] > 0).mean())}
+                          "share_positive": float((bets["clv"] > 0).mean()),
+                          "label": "no-vig CLV: decision decimal x no-vig closing probability - 1"}
+        pc = bets["price_clv"].dropna()
+        summary["price_clv"] = {"n": int(len(pc)), "mean": float(pc.mean()), "median": float(pc.median()),
+                                "share_positive": float((pc > 0).mean()),
+                                "label": "price-based CLV: decision decimal / closing decimal (same book) - 1"}
     summary["overfitting_check"] = threshold_sweep(priced.assign(game_id=lambda d: d["game_key"]), p_col,
                                                    thresholds, n_boot, seed)
     return bets, summary

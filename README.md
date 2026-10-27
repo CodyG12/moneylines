@@ -318,8 +318,8 @@ importance, metrics history, alerts, retraining history and the model registry.
 
 ### Known limitations
 
-- No timestamped historical odds, so no market benchmark and no valid profitability backtest. Start
-  `scripts/collect_odds.py` on a schedule now. A paid Odds API plan can backfill from June 2020.
+- No timestamped historical odds before 2026-27 (see Phase 3: live collection started 2026-10-27).
+  A paid Odds API plan can backfill from June 2020 (`scripts/collect_odds.py --historical`).
 - No injury or lineup data. This is likely the largest missing signal, especially near the market.
 - Neutral-site games before 2024-25 are still unflagged. The schedule endpoint doesn't mark them either.
 - Pre-2017 rows have no tip-off time, so they use a nominal 09:00 ET prediction time.
@@ -327,6 +327,149 @@ importance, metrics history, alerts, retraining history and the model registry.
 - Elo features use the default config. Only the Elo *baseline* is tuned per window.
 - Logistic coefficients on correlated strength features (e.g. Elo vs adjusted margin) are not
   individually interpretable.
+
+## Phase 3: odds archive, market benchmark, Elo blending, paper trading
+
+Paper trading only: nothing in this project places or can place a real bet.
+
+### Odds snapshot collection (`odds_collect.py`, `odds_store.py`, `odds_schedule.py`)
+
+- **Provider:** The Odds API, current NBA moneylines (`h2h`, `regions=us`), requested in American
+  format so quoted prices are stored exactly. One call returns every listed NBA game across about
+  9 US books and costs **1 credit**. The free plan gives 500 credits a month. Put
+  `ODDS_API_KEY=...` in `.env` (gitignored).
+- **Storage:** append-only `odds_snapshots` table in `data/predictions.db`. Each row has the
+  provider event id, NBA `game_key`, book, home/away American and decimal prices, the provider's
+  scheduled start, the NBA tip-off, `observed_at` (when the price was seen), `provider_ts` (the
+  book's last update) and `retrieved_at`. Every observation is kept; nothing is overwritten.
+  Exact repeats (same event, book and observation time) are ignored.
+- **Matching:** provider events map to NBA games by team pair, with the provider's start time
+  within 18 hours of the NBA tip-off. Reversed home/away listings are re-oriented and flagged
+  `flipped`. Two candidate games is `ambiguous` and no candidate is `unmatched`; neither is used.
+  `update-results` re-matches snapshots stored before their game reached the schedule.
+- **Validation:** rejects missing prices, American odds with |x| < 100, decimal odds ≤ 1, margins
+  outside −2% to 25%, provider timestamps after the observation, and unknown teams. Prices
+  observed at or after tip-off are stored but flagged `is_pregame = 0` and never read.
+- **Reliability:** retries rate limits (429), 5xx and network errors with exponential backoff
+  (2, 4, 8, 16 s). Auth and quota errors fail at once. Every run, including failures and skips, is
+  logged in `odds_collection_runs` with counts and remaining credits.
+- **Schedule:** targets are 24 h, 6 h, 1 h and 15 min before each tip-off. Run
+  `scripts/collect_odds_cron.sh` from cron every 5 minutes. A credit is spent only when a target's
+  time has arrived and no call has covered its tolerance window yet, so one call can serve every
+  game sharing a tip-off. Stored times are actual observation times; targets are only intentions,
+  and `odds-status` shows which offsets were hit or missed for each game.
+- **Budget guard:** before each call, projected use to month end is checked against the remaining
+  credits (less a 25-credit reserve). Offsets are dropped in the order 24 h, 6 h, 1 h, 15 min.
+- **Credit estimate** (`make odds-plan`, 2026-27 schedule from 2026-10-27, 5-minute polling):
+
+  | offsets | calls in the rest of the season | per 30 days | busiest month |
+  |---|---|---|---|
+  | 24h, 6h, 1h, 15m | 1,997 | 360 | 431 (Jan) |
+  | 6h, 1h, 15m | 1,962 | 354 | 426 |
+  | 1h, 15m | 1,482 | 267 | 324 |
+  | 15m | 741 | 134 | 162 |
+
+  The full schedule fits the free plan. The 24 h target adds few calls because it usually
+  coincides with the previous day's slots. If the machine is asleep, targets are missed and
+  reported as missed, never back-filled.
+
+### Market benchmark (`market.py`)
+
+No-vig method: proportional normalisation. Raw implied probability is `q = 1/decimal`, the margin
+is `q_home + q_away − 1`, and the no-vig probability is `q_side / (q_home + q_away)`. It ignores
+favourite-longshot bias.
+
+`predict` now attaches, to every prediction, each book's latest pregame price observed at or before
+the prediction's own timestamp (at most 120 minutes old). It stores them in `prediction_odds`, and
+also stores the Elo, logistic, boosting, ensemble and shadow-blend probabilities. `market-benchmark`
+scores every model and the no-vig market on identical games and timestamps. It groups results by
+horizon before tip-off (≤30 min, 30 min–2 h, 2–12 h, >12 h) and reports log loss, Brier, accuracy,
+calibration and date-clustered 95% CIs on model-minus-market differences. Fewer than 500 games is
+labelled preliminary. A price observed after its prediction is never compared.
+
+### Early-season Elo blending (`blend.py`)
+
+The blend is `P = w·P_Elo + (1−w)·P_ML`, with the champion `p_logistic_raw` as the ML model. There
+are five methods: fixed w, w per games-played bucket, w per season-phase bucket, exponential decay
+in games played, and early-only (w for the first 15 games, 0 after). Weights are chosen
+season by season on earlier seasons only (forward-chaining over development walk-forward
+predictions). The final holdout is used for one confirmation look, which is logged in
+`artifacts/final_test_log.jsonl`.
+
+Result (2026-10-27, 9,519 development games, seasons 2017–2024):
+
+| model | log loss | diff vs logistic [95% CI] | first 15 games diff [95% CI] |
+|---|---|---|---|
+| logistic (base) | 0.6229 | | |
+| Elo alone | 0.6267 | +0.0038 [+0.0018, +0.0058] | −0.0000 [−0.0059, +0.0064] |
+| blend: fixed (chosen w fell from 0.85 to 0.35 as training history grew) | 0.6235 | +0.0006 [−0.0006, +0.0018] | −0.0025 [−0.0065, +0.0016] |
+| blend: decay | 0.6230 | +0.0001 [−0.0010, +0.0012] | −0.0016 [−0.0061, +0.0033] |
+| blend: early-only (w=0.6) | 0.6225 | −0.0003 [−0.0013, +0.0007] | −0.0017 [−0.0064, +0.0033] |
+
+Early in the season, Elo alone is as good as the logistic model, and blends are slightly better on
+average. No method's improvement is distinguishable from zero, and blending everywhere hurts
+mid-season and late-season. The holdout confirmation for early-only is +0.0001 [−0.0018, +0.0019].
+**Blending is not enabled.** `p_blend` is logged next to every live prediction as a shadow
+probability, so it keeps being tested on new games. The pre-set rule enables it only if the best
+method's overall CI is below 0 and it is not worse early in the season.
+
+### Closing-line value (`clv.py`)
+
+Price-based CLV is `decision decimal / closing decimal − 1` for the same book and side. The close
+is that book's final pregame snapshot, observed after the decision price and within 30 minutes of
+tip-off. Otherwise the status is `no_close_snapshot`, `no_later_snapshot` or `close_too_early`. If
+the decision used the best price across books, the close is the best price across books, labelled
+`best_vs_best_close`; there is no other cross-book substitution. The no-vig probability move from
+decision to close is also stored. Positive CLV alone is not proof of profitability.
+
+### Live paper trading (`paper.py`)
+
+There is one immutable decision per game per strategy. It is made at the first logged prediction
+30–90 minutes before tip-off, before tip-off only, using only the price recorded with that
+prediction. The outcomes are `bet` or an abstention reason: `below_threshold`, `no_odds`,
+`stale_odds`, `low_history` (optional), `model_disagreement` (spread > 0.20), `edge_too_large`
+(|model − no-vig| > 0.10, likelier a missing-information error than value) or
+`daily_exposure_cap`. There is at most one side per game. Stakes are reported two ways: flat
+1 unit, and ¼-Kelly capped at 2% of bankroll, 5 units per bet (a stand-in for book limits) and
+10% of bankroll per date. Kelly uses the bankroll from results settled before the decision.
+`update-results` settles decisions, computes CLV, appends market metrics and runs missing-data
+checks. Reports include ROI with a date-clustered CI, win rate vs break-even, max drawdown, bankroll
+history, mean estimated edge and EV, and CLV by model, book and season. Results are flagged
+preliminary below 300 settled bets.
+
+The historical walk-forward and final-test paper trading (`backtest.py`) now read odds from the
+archive (`paths.odds = "db"`) and report price-based CLV next to the no-vig version. It only gains
+games as the archive grows. There is still no pre-2026-27 odds history, because the free plan has
+no historical endpoint.
+
+### Commands
+
+```bash
+scripts/install_odds_schedule.sh   # macOS LaunchAgent: collect every 5 min (--uninstall to remove)
+make collect-odds      # one collection pass (or cron: */5 * * * * .../scripts/collect_odds_cron.sh)
+make odds-plan         # credit estimate      make odds-status   # runs + per-game coverage
+make blend-study       # Elo blending study   make market-benchmark
+make paper-trade       # due paper decisions + SIMULATED ledger
+python -m nbamodel import-odds --csv old_snapshots.csv   # bring a CSV archive into the database
+```
+
+The dashboard adds odds monitoring (latest prices by book, movement since the first snapshot,
+missing-odds warnings, collection runs), model versus market, the live market benchmark, the
+blending study and the live paper ledger. Sections are labelled LIVE DATA, LIVE PREDICTIONS,
+HISTORICAL EVALUATION or SIMULATED.
+
+### Phase 3 limitations
+
+- Collection started 2026-10-27, so no game has a closing snapshot yet. Every model-versus-market,
+  CLV and paper-trading number is empty or preliminary until a few hundred games accumulate.
+- The free plan has no historical odds. Backtests before 2026-27 still have no market comparison.
+- Observation times depend on cron running and the machine being awake; missed targets are
+  reported, not hidden.
+- Books post lines about a day ahead, so the 24 h snapshot often has no prices for later games.
+- The model has no injury or lineup information. Large model-versus-market gaps early in the
+  season (e.g. 22 points on DET @ NYK, 2026-10-27) are why `edge_too_large` exists.
+- Proportional de-vig is the only method implemented. Power and Shin methods would shift
+  longshot probabilities slightly.
 
 ## Layout
 
@@ -354,8 +497,15 @@ nbamodel/
   store.py                SQLite prediction log, result reconciliation, drift, retraining triggers
   availability.py         timestamped injury-report adapter (not in default features)
   dashboard.py            static HTML dashboard
+  odds_store.py           Phase 3 append-only odds snapshot archive: validation, event matching
+  odds_schedule.py        snapshot targets, credit simulator, budget guard
+  odds_collect.py         one collection pass (provider -> validate -> store -> run log)
+  market.py               no-vig benchmark at matching prediction times
+  blend.py                early-season Elo blending study
+  clv.py                  price-based closing-line value
+  paper.py                live paper-trading ledger (decisions, settlement, bankroll)
   cli.py, __main__.py     `python -m nbamodel ...`
-config/phase2.json        Phase 2 settings
+config/phase2.json        settings (Phase 3 adds the odds, paper and blend sections)
 Makefile                  reproducible commands
 scripts/                  sample data, nba_api fetch, schedule update, odds collection
 tests/                    pytest suite
@@ -366,7 +516,9 @@ data/sample/              synthetic fixture
 
 - **Done in Phase 2:** walk-forward validation, in-window Elo tuning, boosting, calibration,
   prediction log, drift checks, dashboard.
-- **Next:** archive timestamped odds daily, then a market benchmark, CLV and a valid paper-trading backtest.
+- **Done in Phase 3:** odds archive and scheduler, market benchmark, Elo blending study (not enabled),
+  price CLV, live paper ledger.
+- **Next:** accumulate about 300 games of snapshots, then read the first model-versus-market and CLV results.
 - Timestamped injury-report ingestion, through `availability.py`.
-- Travel / time-zone features; a better early-season model (blend toward Elo when few games are played).
+- Travel / time-zone features; preseason priors (roster changes) for the early season, where blending alone did not help.
 - FastAPI + interactive frontend; PostgreSQL if the SQLite log outgrows a single machine.
