@@ -563,6 +563,71 @@ GitHub disables scheduled workflows after 60 days without repository activity. T
 results push should count as activity. If the schedule does get disabled, re-enable it in the
 Actions tab.
 
+## Phase 4: injury-aware predictions (in progress)
+
+Built in milestones. Done: **1. official injury report ingestion.** Next: player data, player-impact
+features, an injury-aware model comparison with calibration, a risk-adjusted opportunity ranking,
+and the upgraded `make today`. Until those land, injuries are archived but not used by the model.
+
+### Official injury reports (`nbamodel/injuries.py`)
+
+**Source.** The league's official reports are published as PDFs at
+https://official.nba.com/nba-injury-report-2026-27-season/. Since 2026-27 they come out every 15
+minutes on game days; before that the files are hourly. The archive starts in the 2019-20 season.
+Both your Mac and GitHub's runners can download them (tested 2026-10-28). They are free: no API
+credits are used.
+
+**Timestamps.** Each report's page header gives its real publication time (US/Eastern), and that is
+the time stored. The file name can be off: `Injury-Report_2023-01-10_05PM.pdf` says "05:30 PM" in its
+header. Retrieval time, URL and the PDF's sha256 are stored too.
+
+**Storage is append-only** (`injury_report_files`, `injury_reports` in `data/predictions.db`):
+- Every URL tried gets a row, including missing ones.
+- Player rows are a change log. A row is written when a player's status or reason changes, or as
+  `not_listed` when a report still lists the game but drops the player.
+- `injuries.statuses_asof(con, t)` replays the log, so the contents of any report published at or
+  before `t` can be rebuilt exactly. A report published after `t` is never visible.
+- One night of 15-minute reports is about 130 rows.
+
+**Rules the readers follow:**
+- A player who was never listed is unknown, not available.
+- "NOT YET SUBMITTED" is kept as a team-level `not_submitted` status.
+- Report freshness comes from the newest report file, which is not always the newest change.
+- Box scores and final participation are never substituted for a pregame report.
+
+**Parsing.** `pdfplumber` gives word positions, and the columns come from the header row on page 1
+(later pages have no header). Team, matchup, date and time appear only on a group's first row, so
+they are carried forward. A reason that wraps is printed above and below its player's row, and is
+joined back to that player. The tests use word fixtures captured from a 2023 report and a 2026
+report.
+
+**Collection:**
+- Live: every hosted collector pass runs `injuries-refresh`, which ingests any of today's reports
+  that are new. The season page only links the current day's reports.
+- History: `.github/workflows/injury-backfill.yml` (start it from the Actions tab or with
+  `gh workflow run injury-backfill`). It fills `data/injury_history.db` from 2019-20 onward,
+  oldest first. For each game day it tries the hourly files (or :00 and :30 in the 15-minute era)
+  from 11 AM ET until an hour before the last tip-off. That's the latest report a pregame
+  prediction can use. Requests are 1 second apart. Each run saves its progress every 30 minutes to
+  the encrypted `injury-history` branch and starts the next run until the archive is complete.
+  Expect several runs. The history database is kept separate from the collector's state because it
+  is about 40 MB and rarely changes.
+
+```bash
+python -m nbamodel injuries-refresh                     # new reports for today -> data/predictions.db
+python -m nbamodel injuries-status [--date 2026-10-28]  # latest statuses + report age + teams not submitted
+python -m nbamodel injuries-backfill --db data/injury_history.db --start 2019-10-22 [--end ...] [--max-seconds N]
+scripts/state_sync.sh pull-history                      # local copy of the backfilled archive
+```
+
+**Limitations:**
+- Only official statuses are covered: no beat-reporter news, no confirmed starting lineups.
+- A late scratch after the last report before the decision time is not seen.
+- Reports from before 2019-20 do not exist in the archive, so injury-aware backtests cover about
+  half of the 14,403 training games.
+- A team's first report of the day often says "NOT YET SUBMITTED".
+- The 15-minute era's first files of the day can be missing.
+
 ## Layout
 
 ```
@@ -596,6 +661,7 @@ nbamodel/
   blend.py                early-season Elo blending study
   clv.py                  price-based closing-line value
   paper.py                live paper-trading ledger (decisions, settlement, bankroll)
+  injuries.py             official NBA injury reports: fetch, parse, append-only change log
   cli.py, __main__.py     `python -m nbamodel ...`
 config/phase2.json        settings (Phase 3 adds the odds, paper and blend sections)
 Makefile                  reproducible commands

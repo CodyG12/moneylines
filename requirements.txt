@@ -7,3 +7,4 @@ pytest>=7
 # Optional: `pip install lightgbm` for walk_forward.gbm_backend = "lightgbm"
 # (macOS also needs `brew install libomp`). The default backend is scikit-learn's
 # HistGradientBoostingClassifier, which needs no native dependency.
+pdfplumber>=0.11   # official NBA injury report PDFs (nbamodel/injuries.py)

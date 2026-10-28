@@ -4,12 +4,16 @@
 #   state:   written only by the GitHub Actions collector: data/predictions.db, model artifacts, the
 #            walk-forward reference report, the latest upcoming-predictions CSV and logs/actions/.
 #   results: written only by the Mac (stats.nba.com blocks GitHub's runners): data/raw/nba_games.csv.
+#   injury-history: written only by the injury-backfill workflow: data/injury_history.db (official
+#            injury reports from 2019-20 on; kept apart because it is large and rarely changes).
 # Each push replaces the branch with one new commit, so the branches never accumulate history.
 #
 #   scripts/state_sync.sh push-state     pack + encrypt + force-push the state branch
 #   scripts/state_sync.sh pull-state     fetch + decrypt + unpack it over the working copy
 #   scripts/state_sync.sh push-results   encrypt + force-push data/raw/nba_games.csv
 #   scripts/state_sync.sh pull-results   fetch + decrypt it; prints the results commit id
+#   scripts/state_sync.sh push-history   encrypt + force-push data/injury_history.db (backfill workflow only)
+#   scripts/state_sync.sh pull-history   fetch + decrypt it
 #
 # Key: STATE_KEY from the environment, else from .env (the same value as the STATE_KEY repo secret).
 set -euo pipefail
@@ -29,6 +33,16 @@ trap 'rm -rf "$tmp"' EXIT
 
 crypt() {  # crypt -e|-d IN OUT
   openssl enc "$1" -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -salt -pass env:STATE_KEY -in "$2" -out "$3"
+}
+
+snapshot() {  # snapshot DB OUT: consistent single-file copy (the live file may be in WAL mode)
+  "$PY" - "$1" "$2" <<'PY'
+import sqlite3, sys
+src, dst = sqlite3.connect(sys.argv[1]), sqlite3.connect(sys.argv[2])
+src.backup(dst)
+dst.execute("PRAGMA journal_mode=DELETE")
+dst.close(); src.close()
+PY
 }
 
 publish() {  # publish BRANCH FILE NAME
@@ -51,14 +65,7 @@ fetch() {  # fetch BRANCH NAME OUT
 case "${1:-}" in
   push-state)
     mkdir -p "$tmp/db/data"
-    # Consistent single-file copy (the live file may be in WAL mode with a -wal side file).
-    "$PY" - "$tmp/db/data/predictions.db" <<'PY'
-import sqlite3, sys
-src, dst = sqlite3.connect("data/predictions.db"), sqlite3.connect(sys.argv[1])
-src.backup(dst)
-dst.execute("PRAGMA journal_mode=DELETE")
-dst.close(); src.close()
-PY
+    snapshot data/predictions.db "$tmp/db/data/predictions.db"
     present=()
     for p in "${STATE_PATHS[@]}"; do [ -e "$p" ] && present+=("$p"); done
     tar -czf "$tmp/state.tgz" -C "$tmp/db" data/predictions.db -C "$PWD" ${present[@]+"${present[@]}"}
@@ -88,8 +95,21 @@ PY
     mv "$tmp/games.csv" data/raw/nba_games.csv
     git rev-parse "$REMOTE/results"
     ;;
+  push-history)
+    snapshot data/injury_history.db "$tmp/history.db"
+    crypt -e "$tmp/history.db" "$tmp/history.enc"
+    publish injury-history "$tmp/history.enc" injury_history.db.enc
+    ;;
+  pull-history)
+    fetch injury-history injury_history.db.enc "$tmp/history.enc"
+    crypt -d "$tmp/history.enc" "$tmp/history.db"
+    mkdir -p data
+    rm -f data/injury_history.db-wal data/injury_history.db-shm
+    mv "$tmp/history.db" data/injury_history.db
+    echo "restored data/injury_history.db from $(git rev-parse --short "$REMOTE/injury-history")"
+    ;;
   *)
-    echo "usage: $0 push-state|pull-state|push-results|pull-results" >&2
+    echo "usage: $0 push-state|pull-state|push-results|pull-results|push-history|pull-history" >&2
     exit 1
     ;;
 esac
