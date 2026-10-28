@@ -8,4 +8,5 @@ data/raw/
 artifacts/
 data/processed/
 data/*.db
+data/*.db-*
 logs/
