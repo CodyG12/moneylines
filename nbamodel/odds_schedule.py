@@ -90,6 +90,15 @@ def due(targets: pd.DataFrame, call_times, now: pd.Timestamp) -> pd.DataFrame:
     return targets[open_ & ~satisfied(targets, call_times)]
 
 
+def next_target(targets: pd.DataFrame, call_times, now: pd.Timestamp):
+    """Earliest target time that still needs a call: unsatisfied, window not closed, game not started.
+    It can be in the past when a target is due right now. None when nothing is left."""
+    if targets.empty:
+        return None
+    left = targets[(now <= targets["end"]) & (now < targets["tip"]) & ~satisfied(targets, call_times)]
+    return None if left.empty else left["target"].min()
+
+
 def simulate(targets: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, poll_minutes: int = 5,
              prior_calls=()) -> list:
     """Replay the live rule (poll every `poll_minutes`, call when something is due) and return the

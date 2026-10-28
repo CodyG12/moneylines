@@ -10,3 +10,4 @@ data/processed/
 data/*.db
 data/*.db-*
 logs/
+.reconciled

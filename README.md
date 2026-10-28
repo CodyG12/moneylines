@@ -481,7 +481,9 @@ Everything below is paper trading and research. Nothing places a real bet.
 make today
 ```
 
-It runs four steps:
+With hosted collection (below), `make today` pulls the collector's state and prints today's table
+from it without writing anything (`today --no-refresh --no-log`). When this Mac is the collector,
+use `make today-local`, which runs four steps:
 1. Refreshes results and the schedule from nba_api.
 2. Reconciles finished games: adds results and scores, updates accuracy, Brier and log loss, settles
    paper decisions and computes CLV.
@@ -518,6 +520,48 @@ awake. It does not run while the computer is asleep or off. Missed snapshot targ
 missed. After a wake, the next 5-minute run catches up on reconciliation, but missed odds cannot be
 recovered. To keep collecting with the Mac off, run the same `scripts/collect_odds_cron.sh` on an
 always-on machine (a small VPS or a Raspberry Pi) with the repo, `.venv`, `.env` and the database.
+
+### Hosted collection (GitHub Actions)
+
+So collection keeps running while the Mac sleeps, `.github/workflows/collector.yml` runs it on
+GitHub's runners and the Mac only supplies results.
+
+- **Collector:** started every 30 minutes, one run at a time (the next run waits in the queue).
+  Each run (`scripts/actions_collector.sh`) restores the state, then every 5 minutes scores new
+  results, runs `collect-odds --then-predict` and pushes the state when anything changed. It ends
+  after 5h40m, or early when no snapshot target opens within 6 hours (`python -m nbamodel
+  odds-next`). GitHub often starts scheduled runs late, so a run that is already polling covers the
+  15-minute targets.
+- **Results come from the Mac:** stats.nba.com does not answer GitHub's runners (tested
+  2026-10-28: every request timed out). `scripts/results_cron.sh` runs `make data-update` once a
+  day after 10:00 UTC, or on the next wake, and pushes the games CSV. If the Mac stays off,
+  scoring waits. Odds collection does not.
+- **State is encrypted:** the repo is public, so the `state` branch (database, models,
+  walk-forward report, upcoming predictions, `logs/actions/`) and the `results` branch (games CSV)
+  only hold AES-256 ciphertext (`scripts/state_sync.sh`). Each push replaces the branch with a
+  single commit. Each run that reconciles also uploads the encrypted state as a 14-day artifact.
+  Each branch has one writer: the collector writes `state` and the Mac writes `results`.
+- **Read-only on the Mac:** `make pull` replaces `data/predictions.db`, `artifacts/` and
+  `logs/actions/` with the collector's copy and rebuilds the dashboard. Disconnect DBCode first;
+  the script refuses while the file is open. Anything written to the local database is
+  overwritten on the next pull.
+
+One-time setup:
+
+```bash
+openssl rand -base64 32                  # put it in .env as STATE_KEY=...
+gh secret set STATE_KEY                  # paste the same value
+gh secret set ODDS_API_KEY               # paste the Odds API key
+scripts/install_results_schedule.sh      # stops local odds collection, installs the results push
+make seed-state                          # upload this Mac's database, models and results
+gh workflow run collector -f check_only=true   # restore + status only; then let the schedule run
+```
+
+To go back to local collection: `gh workflow disable collector`, `make pull`, then
+`scripts/install_results_schedule.sh --uninstall` and `scripts/install_odds_schedule.sh`.
+GitHub disables scheduled workflows after 60 days without repository activity. The Mac's daily
+results push should count as activity. If the schedule does get disabled, re-enable it in the
+Actions tab.
 
 ## Layout
 
@@ -556,6 +600,7 @@ nbamodel/
 config/phase2.json        settings (Phase 3 adds the odds, paper and blend sections)
 Makefile                  reproducible commands
 scripts/                  sample data, nba_api fetch, schedule update, odds collection
+.github/workflows/        hosted odds collector (GitHub Actions)
 tests/                    pytest suite
 data/sample/              synthetic fixture
 ```

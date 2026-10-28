@@ -4,7 +4,8 @@ SEASON ?= 2026-27
 NBA = $(PY) -m nbamodel
 
 .PHONY: test data-fetch data-update dataset walk-forward final-test train predict update-results retrain dashboard daily phase1 \
-        collect-odds odds-plan odds-status blend-study market-benchmark paper-trade today weekly-report
+        collect-odds odds-plan odds-status blend-study market-benchmark paper-trade today today-local weekly-report \
+        pull seed-state push-results
 
 test:            ## full pytest suite
 	$(PY) -m pytest -q
@@ -62,10 +63,27 @@ market-benchmark: ## models vs no-vig market at matching prediction times
 paper-trade:     ## due paper decisions + SIMULATED ledger report (never real bets)
 	$(NBA) paper-trade
 
-today:           ## game day: refresh results, reconcile last night, refresh stale odds, predict today
+today:           ## game day (hosted collection): pull the collector's state, show today's predictions, write nothing
+	$(MAKE) -s pull
+	$(NBA) today --no-refresh --no-log
+
+today-local:     ## game day when this Mac is the collector: refresh results, reconcile, refresh stale odds, predict
 	$(MAKE) -s data-update
 	$(NBA) update-results
 	$(NBA) today
+
+# ---- Hosted collection: GitHub Actions collects, this Mac pushes results (see README) ----
+pull:            ## read-only local copy of the collector's state (database, models, logs) + dashboard
+	scripts/state_sync.sh pull-state
+	$(NBA) dashboard
+
+seed-state:      ## ONE-TIME: upload this Mac's database, models and results as the collector's starting state
+	scripts/state_sync.sh push-state
+	scripts/state_sync.sh push-results
+
+push-results:    ## refresh results/schedule from stats.nba.com and push them for the collector
+	$(MAKE) -s data-update
+	scripts/state_sync.sh push-results
 
 weekly-report:   ## last 7 days: accuracy, Brier, log loss, calibration, market, paper -> out/reports/
 	$(NBA) weekly-report

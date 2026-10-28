@@ -26,6 +26,16 @@ def test_call_inside_window_satisfies_but_not_after_tipoff():
     assert osch.due(tg, ["2026-10-26T22:45Z"], T("2026-10-26T22:50Z")).empty
 
 
+def test_next_target_skips_satisfied_and_closed_targets():
+    cfg = osch.ScheduleConfig(offsets_minutes=(60, 15))
+    tg = osch.targets_for(GAMES.iloc[[0]], cfg)          # targets 22:00 (window 21:50-22:20) and 22:45
+    assert osch.next_target(tg, [], T("2026-10-26T20:00Z")) == T("2026-10-26T22:00Z")
+    assert osch.next_target(tg, [], T("2026-10-26T22:10Z")) == T("2026-10-26T22:00Z")   # due now
+    assert osch.next_target(tg, ["2026-10-26T22:05Z"], T("2026-10-26T22:10Z")) == T("2026-10-26T22:45Z")
+    assert osch.next_target(tg, [], T("2026-10-26T23:00Z")) is None                     # tipped off
+    assert osch.next_target(tg.iloc[0:0], [], T("2026-10-26T20:00Z")) is None
+
+
 def test_one_call_serves_games_with_the_same_tipoff():
     two = pd.concat([GAMES.iloc[[0]], GAMES.iloc[[0]].assign(game_key="g2", home_team="BOS", away_team="NYK")])
     cfg = osch.ScheduleConfig(offsets_minutes=(60, 15))

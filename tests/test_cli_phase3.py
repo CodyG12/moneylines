@@ -119,6 +119,43 @@ def test_today_excludes_started_games_without_calling_the_api(env, capsys):
     assert "no games left to predict" in out and ("already started" in out or "final result" in out)
 
 
+def test_today_no_log_leaves_the_database_unchanged(env, tmp_path, capsys):
+    d, cfg = env
+    raw = pd.read_csv(cfg["paths"]["games"])
+    raw = raw[raw["home_score"].notna()]
+    last, raw = raw.iloc[-1], raw.iloc[:-1]     # reschedule the last played game for tomorrow
+    tomorrow = pd.Timestamp.now(tz="US/Eastern").normalize().tz_localize(None) + pd.Timedelta(days=1)
+    tip = (tomorrow + pd.Timedelta(hours=23)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    row = last.copy()
+    row[["home_score", "away_score"]] = [None, None]
+    row["date"], row["tipoff_utc"] = tomorrow.date().isoformat(), tip
+    games = pd.concat([raw, row.to_frame().T], ignore_index=True)
+    games.to_csv(tmp_path / "games.csv", index=False)
+    count = lambda t: store.connect(cfg["paths"]["db"]).execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]  # noqa: E731
+    before = (count("predictions"), count("paper_decisions"))
+    out = tmp_path / "today.csv"
+    assert run(env, "today", "--games", str(tmp_path / "games.csv"), "--date", tomorrow.date().isoformat(),
+               "--no-refresh", "--no-log", "--out", str(out)) == 0
+    assert "not logged (--no-log)" in capsys.readouterr().out
+    assert (count("predictions"), count("paper_decisions")) == before
+    assert len(pd.read_csv(out)) == 1
+
+
+def test_odds_next_exit_code_follows_the_horizon(env, tmp_path, capsys):
+    d, cfg = env
+    raw = pd.read_csv(cfg["paths"]["games"])
+    raw = raw[raw["home_score"].notna()]
+    soon = (pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    row = raw.iloc[-1].copy()                   # the last played game, rescheduled to tip in 3 hours
+    row[["home_score", "away_score"]] = [None, None]
+    row["tipoff_utc"] = soon
+    pd.concat([raw.iloc[:-1], row.to_frame().T]).to_csv(tmp_path / "g.csv", index=False)
+    # targets at tip-24h (window closed), -6h (closed), -1h (in 2h) and -15m
+    assert run(env, "odds-next", "--games", str(tmp_path / "g.csv"), "--within-hours", "6") == 0
+    assert run(env, "odds-next", "--games", str(tmp_path / "g.csv"), "--within-hours", "1") == 1
+    assert "next snapshot target" in capsys.readouterr().out
+
+
 def test_weekly_report_from_stored_records(env, capsys):
     d, cfg = env
     with store.connect(cfg["paths"]["db"]) as con:

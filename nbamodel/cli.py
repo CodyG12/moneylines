@@ -541,6 +541,24 @@ def cmd_odds_plan(args, cfg):
     return 0
 
 
+def cmd_odds_next(args, cfg):
+    """Exit 0 when an unsatisfied snapshot target opens within --within-hours (the hosted collector keeps
+    polling), 1 when none does (it can stop until the next scheduled start)."""
+    games, _, _ = load_games_from(cfg, args.games, None)
+    sc = _schedule(cfg)
+    now = pd.Timestamp.now(tz="UTC")
+    with store.connect(cfg["paths"]["db"]) as con:
+        calls = odds_collect.call_times(con, cfg.get("odds", {}).get("provider", "the-odds-api"))
+    tg = odds_schedule.targets_for(games[~games["played"]], sc)
+    nxt = odds_schedule.next_target(tg, calls, now)
+    if nxt is None:
+        print("no unsatisfied snapshot target in the schedule")
+        return 1
+    hours = max(0.0, (nxt - now) / pd.Timedelta(hours=1))
+    print(f"next snapshot target {nxt:%Y-%m-%d %H:%M} UTC ({hours:.1f} h)")
+    return 0 if hours <= args.within_hours else 1
+
+
 def cmd_odds_status(args, cfg):
     games, _, _ = load_games_from(cfg, args.games, None)
     now = pd.Timestamp.now(tz="UTC")
@@ -722,10 +740,12 @@ def cmd_today(args, cfg):
     with store.connect(cfg["paths"]["db"]) as con:
         preds, quotes = market.attach_market_asof(preds, odds_store.load_snapshots(con), book,
                                                   cfg.get("odds", {}).get("max_age_minutes", 120))
-        n = store.log_predictions(con, preds)
-        n_q = store.log_prediction_odds(con, preds, quotes)
+        n = n_q = 0
+        if not args.no_log:
+            n = store.log_predictions(con, preds)
+            n_q = store.log_prediction_odds(con, preds, quotes)
         decided = pd.DataFrame()
-        if cfg.get("paper", {}).get("enabled"):
+        if cfg.get("paper", {}).get("enabled") and not args.no_log:
             decided = paper.decide(con, paper.PaperConfig.from_dict(cfg.get("paper")),
                                    model_version=preds["model_version"].iloc[0])
     out = Path(args.out or f"out/today/predictions_{target.date()}.csv")
@@ -782,7 +802,10 @@ def cmd_today(args, cfg):
           "likely winner is not necessarily the best value, and neither column is a betting recommendation.")
     for g, why in excluded:
         print(f"excluded {g}: {why}")
-    print(f"saved {n} predictions ({n_q} book prices recorded with them) to {cfg['paths']['db']}; wrote {out}")
+    if args.no_log:
+        print(f"not logged (--no-log): {cfg['paths']['db']} is unchanged; wrote {out}")
+    else:
+        print(f"saved {n} predictions ({n_q} book prices recorded with them) to {cfg['paths']['db']}; wrote {out}")
     if not decided.empty:
         print("paper decisions made now (SIMULATED): " + ", ".join(
             f"{k} {v}" for k, v in decided["decision"].value_counts().items()))
@@ -909,6 +932,9 @@ def build_parser():
     op.add_argument("--start")
     op.add_argument("--end")
     os_ = sub.add_parser("odds-status", help="collection runs and per-game snapshot coverage")
+    on = sub.add_parser("odds-next", help="exit 0 if a snapshot target opens within --within-hours, else 1")
+    on.add_argument("--games")
+    on.add_argument("--within-hours", type=float, default=6.0)
     os_.add_argument("--games")
     os_.add_argument("--days", type=int, default=3)
     io = sub.add_parser("import-odds", help="import an odds snapshot CSV into the archive")
@@ -933,6 +959,8 @@ def build_parser():
     td.add_argument("--max-odds-age", type=float, default=30.0,
                     help="reuse archived odds younger than this many minutes (default 30)")
     td.add_argument("--no-refresh", action="store_true", help="never call the API; use the archive only")
+    td.add_argument("--no-log", action="store_true",
+                    help="report only: no predictions or paper decisions written (read-only mirror of the archive)")
     td.add_argument("--markdown", action="store_true")
     td.add_argument("--out")
     pt = sub.add_parser("paper-trade", help="make due paper decisions and report the simulated ledger")
@@ -944,7 +972,8 @@ def build_parser():
 COMMANDS = {"build-dataset": cmd_build_dataset, "walk-forward": cmd_walk_forward, "final-test": cmd_final_test,
             "evaluate": cmd_evaluate, "train": cmd_train, "predict": cmd_predict,
             "update-results": cmd_update_results, "dashboard": cmd_dashboard,
-            "collect-odds": cmd_collect_odds, "odds-plan": cmd_odds_plan, "odds-status": cmd_odds_status,
+            "collect-odds": cmd_collect_odds, "odds-plan": cmd_odds_plan, "odds-next": cmd_odds_next,
+            "odds-status": cmd_odds_status,
             "import-odds": cmd_import_odds, "blend-study": cmd_blend_study, "market-benchmark": cmd_market_benchmark,
             "paper-trade": cmd_paper_trade, "today": cmd_today,
             "weekly-report": cmd_weekly_report}
