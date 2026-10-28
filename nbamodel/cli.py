@@ -36,7 +36,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import blend, clv, market, odds_collect, odds_schedule, odds_store, paper, plots, registry, store
+from . import blend, clv, injuries, market, odds_collect, odds_schedule, odds_store, paper, plots, registry, store
 from .backtest import BettingConfig, paper_trade
 from .data import DataError, prepare_games
 from .dataset import DatasetConfig, build_training_dataset
@@ -559,6 +559,50 @@ def cmd_odds_next(args, cfg):
     return 0 if hours <= args.within_hours else 1
 
 
+def cmd_injuries_refresh(args, cfg):
+    games, _, _ = load_games_from(cfg, args.games, None)
+    with store.connect(args.db or cfg["paths"]["db"]) as con:
+        try:
+            res = injuries.refresh(con, games)
+        except OSError as exc:  # season page unreachable: nothing recorded, retried next pass
+            print(f"injury reports: refresh failed ({exc})")
+            return 1
+    counts = pd.Series([r["status"] for r in res]).value_counts().to_dict() if res else {}
+    changes = sum(r.get("n_changes", 0) for r in res)
+    print(f"injury reports: {len(res)} new file(s) {counts}; {changes} status change(s) recorded"
+          if res else "injury reports: no new reports")
+    return 0
+
+
+def cmd_injuries_backfill(args, cfg):
+    games, _, _ = load_games_from(cfg, args.games, None)
+    end = args.end or (pd.Timestamp.now(tz=injuries.ET) - pd.Timedelta(days=1)).date().isoformat()
+    with store.connect(args.db) as con:
+        r = injuries.backfill(con, games, args.start, end, args.max_seconds, args.pause)
+        n = con.execute("SELECT COUNT(*), COUNT(DISTINCT game_date) FROM injury_reports").fetchone()
+    print(f"injury backfill {args.start}..{end}: {'complete' if r['complete'] else 'paused at ' + str(r['next_day'])}"
+          f"; this run fetched {r['fetched']} URL(s), {r['found']} report(s) found; {args.db} now holds {n[0]} "
+          f"change rows over {n[1]} game dates" + (" (stopped on a network error)" if r.get("error") else ""))
+    return 0 if r["complete"] else (12 if r.get("error") else 10)   # 10: paused on time, resumable
+
+
+def cmd_injuries_status(args, cfg):
+    day = args.date or pd.Timestamp.now(tz=injuries.ET).date().isoformat()
+    now = pd.Timestamp.now(tz="UTC")
+    with store.connect(args.db or cfg["paths"]["db"]) as con:
+        st = injuries.statuses_asof(con, now, [day])
+        cov = injuries.report_coverage(con, now, day)
+    if st.empty:
+        print(f"no injury report ingested for {day} (run injuries-refresh)")
+        return 0
+    age = cov["report_age_minutes"]
+    print(f"{day}: latest report {cov['report_published_at']} ({age:.0f} min old); not yet submitted: "
+          f"{', '.join(cov['not_submitted']) or 'none'}")
+    shown = st[st["status"] != injuries.NOT_SUBMITTED].sort_values(["matchup", "team", "status", "player_name"])
+    print(shown[["matchup", "team", "player_name", "status", "reason"]].to_string(index=False))
+    return 0
+
+
 def cmd_odds_status(args, cfg):
     games, _, _ = load_games_from(cfg, args.games, None)
     now = pd.Timestamp.now(tz="UTC")
@@ -932,6 +976,19 @@ def build_parser():
     op.add_argument("--start")
     op.add_argument("--end")
     os_ = sub.add_parser("odds-status", help="collection runs and per-game snapshot coverage")
+    ir = sub.add_parser("injuries-refresh", help="ingest new official NBA injury reports (today's, from the season page)")
+    ir.add_argument("--games")
+    ir.add_argument("--db", help="database (default from config)")
+    ib = sub.add_parser("injuries-backfill", help="fetch historical official injury reports into a separate database")
+    ib.add_argument("--games")
+    ib.add_argument("--db", default="data/injury_history.db")
+    ib.add_argument("--start", default="2019-10-22", help="first game date (the archive starts in 2019-20)")
+    ib.add_argument("--end", help="last game date (default: yesterday, US/Eastern)")
+    ib.add_argument("--max-seconds", type=float, default=3600)
+    ib.add_argument("--pause", type=float, default=1.0, help="seconds between requests")
+    ist = sub.add_parser("injuries-status", help="latest official injury statuses for a game date")
+    ist.add_argument("--date", help="US/Eastern game date (default: today)")
+    ist.add_argument("--db")
     on = sub.add_parser("odds-next", help="exit 0 if a snapshot target opens within --within-hours, else 1")
     on.add_argument("--games")
     on.add_argument("--within-hours", type=float, default=6.0)
@@ -973,6 +1030,8 @@ COMMANDS = {"build-dataset": cmd_build_dataset, "walk-forward": cmd_walk_forward
             "evaluate": cmd_evaluate, "train": cmd_train, "predict": cmd_predict,
             "update-results": cmd_update_results, "dashboard": cmd_dashboard,
             "collect-odds": cmd_collect_odds, "odds-plan": cmd_odds_plan, "odds-next": cmd_odds_next,
+            "injuries-refresh": cmd_injuries_refresh, "injuries-backfill": cmd_injuries_backfill,
+            "injuries-status": cmd_injuries_status,
             "odds-status": cmd_odds_status,
             "import-odds": cmd_import_odds, "blend-study": cmd_blend_study, "market-benchmark": cmd_market_benchmark,
             "paper-trade": cmd_paper_trade, "today": cmd_today,

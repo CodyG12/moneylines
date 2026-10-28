@@ -106,6 +106,25 @@ CREATE TABLE IF NOT EXISTS clv_results (
 );
 """
 
+# Official injury reports (nbamodel/injuries.py): every URL tried, and a change log of player
+# statuses keyed by report publication time. Append-only.
+INJURY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS injury_report_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL UNIQUE, source TEXT NOT NULL, nominal_et TEXT,
+    published_at TEXT, retrieved_at TEXT NOT NULL, http_status INTEGER, sha256 TEXT, n_rows INTEGER,
+    parse_status TEXT NOT NULL, error TEXT, game_dates TEXT
+);
+CREATE TABLE IF NOT EXISTS injury_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL REFERENCES injury_report_files(id),
+    published_at TEXT NOT NULL, retrieved_at TEXT NOT NULL, source TEXT NOT NULL,
+    game_date TEXT NOT NULL, game_time_et TEXT, matchup TEXT, home_team TEXT, away_team TEXT, game_key TEXT,
+    team TEXT, player_name TEXT, player_key TEXT NOT NULL, player_id TEXT, status TEXT, reason TEXT,
+    UNIQUE (file_id, game_date, matchup, team, player_key)
+);
+CREATE INDEX IF NOT EXISTS injury_reports_date ON injury_reports (game_date, published_at);
+CREATE INDEX IF NOT EXISTS injury_reports_game ON injury_reports (game_key, team, published_at);
+"""
+
 # Component probabilities logged next to the published one, so every model can be benchmarked
 # against the market on exactly the same games and timestamps. Added to old databases in place.
 COMPONENT_COLUMNS = ("p_elo", "p_logistic", "p_logistic_raw", "p_gbm", "p_gbm_raw", "p_ensemble", "p_blend")
@@ -118,6 +137,9 @@ def connect(path=DEFAULT_DB) -> sqlite3.Connection:
     con = sqlite3.connect(str(path))
     con.executescript(SCHEMA)
     con.executescript(PHASE3_SCHEMA)
+    con.executescript(INJURY_SCHEMA)
+    if "game_dates" not in {r[1] for r in con.execute("PRAGMA table_info(injury_report_files)")}:
+        con.execute("ALTER TABLE injury_report_files ADD COLUMN game_dates TEXT")
     have = {r[1] for r in con.execute("PRAGMA table_info(predictions)")}
     for col in COMPONENT_COLUMNS:
         if col not in have:

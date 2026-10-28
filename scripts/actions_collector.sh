@@ -2,8 +2,9 @@
 # Hosted collector, run by .github/workflows/collector.yml (one run at a time). Restores the
 # encrypted state, then every 5 minutes:
 #   1. scores results the Mac pushed to the results branch (update-results --retrain-if-due),
-#   2. collects odds if a snapshot target is due, then logs predictions and paper decisions,
-#   3. pushes the state branch when anything changed.
+#   2. ingests new official injury reports,
+#   3. collects odds if a snapshot target is due, then logs predictions and paper decisions,
+#   4. pushes the state branch when anything changed.
 # It stops at its time budget (the next queued run takes over) or as soon as no snapshot target
 # opens within 6 hours. Logs: logs/actions/ (inside the state, so `make pull` brings them to the Mac).
 set -uo pipefail
@@ -35,6 +36,14 @@ while :; do
     echo "$(stamp) no results file; cannot collect" >&2
     exit 1
   fi
+
+  # Official injury reports (free; new files only). Each new report is a change to keep.
+  inj=$("${NBA[@]}" injuries-refresh 2>&1)
+  case "$inj" in
+    "injury reports: no new reports") ;;
+    "injury reports: refresh failed"*) printf '=== %s\n%s\n' "$(stamp)" "$inj" >> "$LOG/injuries.log" ;;
+    *) changed=1; printf '=== %s\n%s\n' "$(stamp)" "$inj" >> "$LOG/injuries.log" ;;
+  esac
 
   out=$("${NBA[@]}" collect-odds --then-predict 2>&1)
   case "$out" in
