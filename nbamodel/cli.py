@@ -36,7 +36,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import blend, clv, injuries, market, odds_collect, odds_schedule, odds_store, paper, plots, registry, store
+from . import blend, clv, espn, injuries, market, odds_collect, odds_schedule, odds_store, paper, plots, registry, store
 from .backtest import BettingConfig, paper_trade
 from .data import DataError, prepare_games
 from .dataset import DatasetConfig, build_training_dataset
@@ -559,6 +559,31 @@ def cmd_odds_next(args, cfg):
     return 0 if hours <= args.within_hours else 1
 
 
+def cmd_results_update(args, cfg):
+    """Results, tip-off times and player box scores from ESPN (see nbamodel/espn.py)."""
+    path = args.games or cfg["paths"]["games"]
+    raw = pd.read_csv(path, comment="#", dtype={"game_id_source": str})
+    today = pd.Timestamp.now(tz=espn.ET).normalize().tz_localize(None)
+    start = pd.Timestamp(args.start) if args.start else today - pd.Timedelta(days=args.days_back)
+    end = today + pd.Timedelta(days=args.days_ahead)
+    try:
+        with store.connect(args.db or cfg["paths"]["db"]) as con:
+            out, st = espn.update(raw, con, start, end)
+    except espn.EspnError as exc:
+        print(f"results update failed: {exc}", file=sys.stderr)
+        return 1
+    if st["updated"] or st["tipoff_changes"] or st["added"]:
+        out = out[raw.columns.tolist() + [c for c in out.columns if c not in raw.columns]]
+        out.sort_values(["date", "home_team"]).to_csv(path, index=False)
+    print(f"ESPN {start.date()}..{end.date()}: {st['updated']} game(s) scored, {st['players']} player box rows, "
+          f"{st['tipoff_changes']} tip-off change(s), {st['added']} game(s) added")
+    for msg in st["conflicts"]:
+        print(f"score conflict (file kept): {msg}")
+    for msg in st["invalid"]:
+        print(f"skipped, failed validation: {msg}")
+    return 0
+
+
 def cmd_injuries_refresh(args, cfg):
     games, _, _ = load_games_from(cfg, args.games, None)
     with store.connect(args.db or cfg["paths"]["db"]) as con:
@@ -976,6 +1001,12 @@ def build_parser():
     op.add_argument("--start")
     op.add_argument("--end")
     os_ = sub.add_parser("odds-status", help="collection runs and per-game snapshot coverage")
+    ru = sub.add_parser("results-update", help="scores, tip-off times and player box scores from ESPN")
+    ru.add_argument("--games")
+    ru.add_argument("--db")
+    ru.add_argument("--start", help="first US/Eastern date (default: --days-back before today)")
+    ru.add_argument("--days-back", type=int, default=3)
+    ru.add_argument("--days-ahead", type=int, default=7, help="also refresh tip-off times this far ahead")
     ir = sub.add_parser("injuries-refresh", help="ingest new official NBA injury reports (today's, from the season page)")
     ir.add_argument("--games")
     ir.add_argument("--db", help="database (default from config)")
@@ -1030,7 +1061,7 @@ COMMANDS = {"build-dataset": cmd_build_dataset, "walk-forward": cmd_walk_forward
             "evaluate": cmd_evaluate, "train": cmd_train, "predict": cmd_predict,
             "update-results": cmd_update_results, "dashboard": cmd_dashboard,
             "collect-odds": cmd_collect_odds, "odds-plan": cmd_odds_plan, "odds-next": cmd_odds_next,
-            "injuries-refresh": cmd_injuries_refresh, "injuries-backfill": cmd_injuries_backfill,
+            "results-update": cmd_results_update, "injuries-refresh": cmd_injuries_refresh, "injuries-backfill": cmd_injuries_backfill,
             "injuries-status": cmd_injuries_status,
             "odds-status": cmd_odds_status,
             "import-odds": cmd_import_odds, "blend-study": cmd_blend_study, "market-benchmark": cmd_market_benchmark,
