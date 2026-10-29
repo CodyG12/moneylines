@@ -1,0 +1,59 @@
+# Backfill ESPN player box scores for past seasons into data/player_history.db, kept encrypted on
+# the player-history branch (scripts/state_sync.sh). Manual start; each run works for up to ~5h,
+# saves its progress every 30 minutes, and starts the next run itself until it is complete.
+# Free (no API credits); requests are spaced one second apart. The current season's box scores are
+# stored by the hosted collector's daily reconcile instead.
+name: player-backfill
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "First game date"
+        default: "2014-10-28"
+      end:
+        description: "Last game date (the current season comes from the collector)"
+        default: "2026-06-30"
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: player-backfill
+  cancel-in-progress: false
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      STATE_KEY: ${{ secrets.STATE_KEY }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -q -r requirements-lock.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Backfill
+        run: |
+          scripts/state_sync.sh pull-results >/dev/null
+          scripts/state_sync.sh pull-history player || echo "no player-history branch yet: starting fresh"
+          stop=$(( $(date +%s) + 18000 ))
+          rc=10
+          while [ "$rc" = 10 ] && [ "$(date +%s)" -lt "$stop" ]; do
+            set +e
+            .venv/bin/python -W ignore -m nbamodel players-backfill --start "${{ inputs.start }}" --end "${{ inputs.end }}" --max-seconds 1800
+            rc=$?
+            set -e
+            scripts/state_sync.sh push-history player >/dev/null
+            [ "$rc" = 0 ] || [ "$rc" = 10 ] || exit "$rc"
+          done
+          if [ "$rc" = 10 ]; then
+            gh workflow run player-backfill -f start="${{ inputs.start }}" -f end="${{ inputs.end }}"
+            echo "not complete yet: started the next run"
+          fi

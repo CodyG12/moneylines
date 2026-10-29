@@ -8,14 +8,17 @@
 #            state that has no games file; nothing writes it any more.
 #   injury-history: written only by the injury-backfill workflow: data/injury_history.db (official
 #            injury reports from 2019-20 on; kept apart because it is large and rarely changes).
+#   player-history: written only by the player-backfill workflow: data/player_history.db (ESPN
+#            player box scores for past seasons).
 # Each push replaces the branch with one new commit, so the branches never accumulate history.
 #
 #   scripts/state_sync.sh push-state     pack + encrypt + force-push the state branch
 #   scripts/state_sync.sh pull-state     fetch + decrypt + unpack it over the working copy
 #   scripts/state_sync.sh push-results   encrypt + force-push data/raw/nba_games.csv
 #   scripts/state_sync.sh pull-results   fetch + decrypt it; prints the results commit id
-#   scripts/state_sync.sh push-history   encrypt + force-push data/injury_history.db (backfill workflow only)
-#   scripts/state_sync.sh pull-history   fetch + decrypt it
+#   scripts/state_sync.sh push-history [injury|player]   encrypt + force-push data/<name>_history.db
+#                                                        (backfill workflows only; default injury)
+#   scripts/state_sync.sh pull-history [injury|player]   fetch + decrypt it
 #
 # Key: STATE_KEY from the environment, else from .env (the same value as the STATE_KEY repo secret).
 set -euo pipefail
@@ -97,21 +100,25 @@ case "${1:-}" in
     mv "$tmp/games.csv" data/raw/nba_games.csv
     git rev-parse "$REMOTE/results"
     ;;
-  push-history)
-    snapshot data/injury_history.db "$tmp/history.db"
-    crypt -e "$tmp/history.db" "$tmp/history.enc"
-    publish injury-history "$tmp/history.enc" injury_history.db.enc
-    ;;
-  pull-history)
-    fetch injury-history injury_history.db.enc "$tmp/history.enc"
-    crypt -d "$tmp/history.enc" "$tmp/history.db"
-    mkdir -p data
-    rm -f data/injury_history.db-wal data/injury_history.db-shm
-    mv "$tmp/history.db" data/injury_history.db
-    echo "restored data/injury_history.db from $(git rev-parse --short "$REMOTE/injury-history")"
+  push-history|pull-history)
+    name=${2:-injury}
+    case "$name" in injury|player) ;; *) echo "unknown history: $name (injury|player)" >&2; exit 1 ;; esac
+    db="data/${name}_history.db"
+    if [ "$1" = push-history ]; then
+      snapshot "$db" "$tmp/history.db"
+      crypt -e "$tmp/history.db" "$tmp/history.enc"
+      publish "$name-history" "$tmp/history.enc" "${name}_history.db.enc"
+    else
+      fetch "$name-history" "${name}_history.db.enc" "$tmp/history.enc"
+      crypt -d "$tmp/history.enc" "$tmp/history.db"
+      mkdir -p data
+      rm -f "$db-wal" "$db-shm"
+      mv "$tmp/history.db" "$db"
+      echo "restored $db from $(git rev-parse --short "$REMOTE/$name-history")"
+    fi
     ;;
   *)
-    echo "usage: $0 push-state|pull-state|push-results|pull-results|push-history|pull-history" >&2
+    echo "usage: $0 push-state|pull-state|push-results|pull-results|push-history [name]|pull-history [name]" >&2
     exit 1
     ;;
 esac

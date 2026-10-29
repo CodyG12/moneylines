@@ -574,9 +574,9 @@ re-enable it in the Actions tab.
 
 ## Phase 4: injury-aware predictions (in progress)
 
-Built in milestones. Done: **1. official injury report ingestion** and **2a. ESPN results and
-current-season player box scores** (see Hosted collection). Next: the player box-score history
-backfill, player-impact features, an injury-aware model comparison with calibration, a
+Built in milestones. Done: **1. official injury report ingestion**, **2a. ESPN results and
+current-season player box scores** (see Hosted collection) and **2b. the player box-score history
+backfill** (below). Next: player-impact features, an injury-aware model comparison with calibration, a
 risk-adjusted opportunity ranking, and the upgraded `make today`. Until those land, injuries and
 player box scores are archived but not used by the model.
 
@@ -638,6 +638,30 @@ scripts/state_sync.sh pull-history                      # local copy of the back
   half of the 14,403 training games.
 - A team's first report of the day often says "NOT YET SUBMITTED".
 - The 15-minute era's first files of the day can be missing.
+
+### Player box-score history (`espn.backfill`)
+
+`.github/workflows/player-backfill.yml` fills `data/player_history.db` (table `player_games`)
+with ESPN box scores for every played game in the games file from 2014-15 to 2025-26. It runs on
+the same schedule pattern as the injury backfill: manual start, progress saved every 30 minutes
+to the encrypted `player-history` branch, and the next run started automatically. It makes about
+17,000 requests (one scoreboard per date, one box score per game), spaced 1 second apart, so it
+takes several runs.
+
+- Each finished date is logged in `espn_fetch_log`, so reruns resume where the last run stopped.
+- A game whose player points don't add up to the final score is recorded in `espn_invalid` and not
+  stored. Before that, it is fetched once more with different query parameters.
+- **Gap:** ESPN has no box score at all for some older games. In January 2015 about 1 in 6 games
+  lists every player with no minutes or points. Those are recorded as "ESPN has no player stats
+  for this game". Player-impact features treat them as missing; nothing is filled in.
+- The current season's box scores come from the collector's daily reconcile and go into
+  `data/predictions.db`.
+
+```bash
+gh workflow run player-backfill                     # 2014-10-28 .. 2026-06-30
+scripts/state_sync.sh pull-history player           # local copy
+python -m nbamodel players-backfill --db data/player_history.db --start ... --end ... [--max-seconds N]
+```
 
 ## Layout
 
