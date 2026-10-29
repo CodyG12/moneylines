@@ -36,7 +36,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import blend, clv, espn, injuries, market, odds_collect, odds_schedule, odds_store, paper, plots, registry, store
+from . import blend, clv, espn, injuries, market, opportunities, odds_collect, odds_schedule, odds_store, paper, plots, registry, store
 from .backtest import BettingConfig, paper_trade
 from .data import DataError, prepare_games
 from .dataset import DatasetConfig, build_training_dataset
@@ -601,6 +601,25 @@ def cmd_players_backfill(args, cfg):
     return 0 if r["complete"] else 10
 
 
+def cmd_uncertainty_fit(args, cfg):
+    """Calibration-shortfall table for conservative probabilities, from development walk-forward
+    predictions only (the final holdout is never used)."""
+    path = Path(cfg["paths"]["walkforward_dir"]) / "predictions.csv"
+    preds = pd.read_csv(path)
+    dev = preds[preds["phase"] == "development"] if "phase" in preds else preds
+    meta = registry.load_model(None, cfg["paths"]["artifacts"])[1]
+    col = args.p_col or (meta.get("reference_metrics") or {}).get("champion", f"p_{meta['model']}")
+    ocfg = opportunities.OpportunityConfig.from_dict(cfg.get("opportunities"))
+    table = opportunities.fit_uncertainty(dev, col, ocfg.early_season_games)
+    out = args.out or (cfg.get("opportunities") or {}).get("uncertainty_table", "config/uncertainty.json")
+    opportunities.save_uncertainty(table, out)
+    print(f"wrote {out}: {col} on {table['n_games']} development games {table['date_range']}")
+    for group in ("early", "later"):
+        print(f"  {group}: " + ", ".join(f"{b['lo']:.2f}-{b['hi']:.2f} -{b['shortfall']:.3f} (n={b['n']})"
+                                         for b in table["groups"][group] if b["n"] and b["lo"] >= 0.5))
+    return 0
+
+
 def cmd_injuries_refresh(args, cfg):
     games, _, _ = load_games_from(cfg, args.games, None)
     with store.connect(args.db or cfg["paths"]["db"]) as con:
@@ -888,6 +907,7 @@ def cmd_today(args, cfg):
           "likely winner is not necessarily the best value, and neither column is a betting recommendation.")
     for g, why in excluded:
         print(f"excluded {g}: {why}")
+    _opportunity_report(cfg, preds, meta, now, book, args)
     if args.no_log:
         print(f"not logged (--no-log): {cfg['paths']['db']} is unchanged; wrote {out}")
     else:
@@ -898,6 +918,79 @@ def cmd_today(args, cfg):
     print("Paper decisions for later tip-offs are made by the scheduled collector 30-90 min before tip-off. "
           "No real bets are placed.")
     return 0
+
+
+def _opportunity_report(cfg, preds, meta, now, book, args):
+    """Sections B-D of `today`: ranked paper-trading opportunities, games to avoid, daily summary."""
+    from .player_impact import minutes_asof
+
+    ocfg = opportunities.OpportunityConfig.from_dict(cfg.get("opportunities"))
+    table = opportunities.load_uncertainty((cfg.get("opportunities") or {}).get("uncertainty_table",
+                                                                               "config/uncertainty.json"))
+    day = str(pd.Timestamp(preds["date"].iloc[0]).date())
+    with store.connect(cfg["paths"]["db"]) as con:
+        statuses = injuries.statuses_asof(con, now, [day])
+        coverage = {day: injuries.report_coverage(con, now, day)}
+        pg = pd.read_sql("SELECT * FROM player_games", con)
+        bank = paper.bankroll_at(con, "live-default", cfg.get("paper", {}).get("initial_bankroll", 100.0), now)
+    flags = opportunities.injury_flags(preds, statuses, coverage, minutes_asof(pg, day) if len(pg) else
+                                       pd.DataFrame(columns=["team", "player_key", "healthy"]), ocfg)
+    ranked = opportunities.rank(preds, ocfg, table, now, flags, bankroll=bank)
+    ranked = ranked.merge(flags[["game_key", "not_submitted"]], on="game_key", how="left")
+    game = ranked["away_team"] + " @ " + ranked["home_team"]
+    pct = lambda v: "n/a" if pd.isna(v) else f"{v:+.1%}"   # noqa: E731
+
+    print("\nINJURY REPORT (official; rotation = 20+ healthy minutes this season)")
+    cov = coverage[day]
+    print(f"  latest report: {cov['report_published_at'] or 'none yet'}"
+          + (f" ({cov['report_age_minutes']:.0f} min old)" if cov["report_age_minutes"] is not None else ""))
+    if pg.empty:
+        print("  player importance unknown: no box scores this season yet (every game counts as missing injury "
+              "information)")
+    for g, f in zip(game, flags.to_dict("records")):
+        bits = [f"out: {f['out_players']}" if f["out_players"] else
+                ("listed players not rated" if pg.empty else "no rotation players out"),
+                f"unresolved: {f['uncertain_players']}" if f["uncertain_players"] else None,
+                f"not yet submitted: {f['not_submitted']}" if f["not_submitted"] else None]
+        print(f"  {g:<11} " + "; ".join(b for b in bits if b))
+
+    elig = ranked[ranked["eligible"]].sort_values("rank")
+    print("\nRANKED PAPER-TRADING OPPORTUNITIES (simulated; ranked by conservative ROI)")
+    if elig.empty:
+        print("  NO QUALIFYING OPPORTUNITIES TODAY")
+    else:
+        rows = [{"Rank": int(r["rank"]), "Matchup": g, "Selection": r["selection"], "Book": book,
+                 "Odds": f"{decimal_to_american_int(r['decimal_odds']):+d}", "Model p": f"{r['p']:.1%}",
+                 "Conservative p": f"{r['p_lower']:.1%}", "Est. ROI": pct(r["roi"]),
+                 "Conservative ROI": pct(r["conservative_roi"]), "Paper stake": f"{r['stake_fraction']:.1%} of bankroll",
+                 "Risk": "early season" if r["early_season"] else "-",
+                 "Why": f"edge {r['edge']:+.3f} vs no-vig, all checks passed"}
+                for g, r in zip(game[elig.index], elig.to_dict("records"))]
+        t = pd.DataFrame(rows)
+        print(_markdown(t) if args.markdown else t.to_string(index=False))
+
+    avoid = ranked[~ranked["eligible"]]
+    print("\nGAMES TO AVOID")
+    for g, r in zip(game[avoid.index], avoid.to_dict("records")):
+        price = (f"{r['selection']} {decimal_to_american_int(r['decimal_odds']):+d}, ROI {pct(r['roi'])}, conservative "
+                 f"{pct(r['conservative_roi'])}") if pd.notna(r.get("decimal_odds")) else f"{r['selection']} (no price)"
+        print(f"  {g:<11} {price}: {r['reason_text']}")
+    if avoid.empty:
+        print("  none")
+
+    best = elig.iloc[0] if not elig.empty else None
+    odds_ts = preds["odds_timestamp"].dropna().max() if "odds_timestamp" in preds else None
+    print("\nDAILY SUMMARY")
+    print(f"  games evaluated: {len(ranked)}; eligible: {len(elig)}; abstentions: {len(ranked) - len(elig)}")
+    print(f"  highest-ranked: " + (f"{best['selection']} ({game[elig.index[0]]}), conservative ROI "
+                                   f"{pct(best['conservative_roi'])}" if best is not None else "none (no bet)"))
+    print(f"  model {meta['version']}; prediction {preds['prediction_timestamp'].iloc[0]}; injury report "
+          f"{cov['report_published_at'] or 'none'}; odds snapshot {odds_ts if pd.notna(odds_ts) else 'none'}")
+    if table is None:
+        print("  WARNING: no uncertainty table (run `python -m nbamodel uncertainty-fit`): conservative p = model p")
+    if not ocfg.validated_edge:
+        print("  NOTE: no validated model edge yet. Live results so far do not show the model beating the market; "
+              "treat every selection as an unproven paper trade.")
 
 
 def with_winner(preds: pd.DataFrame) -> pd.DataFrame:
@@ -1018,6 +1111,9 @@ def build_parser():
     op.add_argument("--start")
     op.add_argument("--end")
     os_ = sub.add_parser("odds-status", help="collection runs and per-game snapshot coverage")
+    uf = sub.add_parser("uncertainty-fit", help="calibration-shortfall table for conservative probabilities")
+    uf.add_argument("--p-col", help="probability column (default: the active model's champion column)")
+    uf.add_argument("--out")
     ru = sub.add_parser("results-update", help="scores, tip-off times and player box scores from ESPN")
     ru.add_argument("--games")
     ru.add_argument("--db")
@@ -1085,7 +1181,7 @@ COMMANDS = {"build-dataset": cmd_build_dataset, "walk-forward": cmd_walk_forward
             "evaluate": cmd_evaluate, "train": cmd_train, "predict": cmd_predict,
             "update-results": cmd_update_results, "dashboard": cmd_dashboard,
             "collect-odds": cmd_collect_odds, "odds-plan": cmd_odds_plan, "odds-next": cmd_odds_next,
-            "results-update": cmd_results_update, "players-backfill": cmd_players_backfill, "injuries-refresh": cmd_injuries_refresh, "injuries-backfill": cmd_injuries_backfill,
+            "uncertainty-fit": cmd_uncertainty_fit, "results-update": cmd_results_update, "players-backfill": cmd_players_backfill, "injuries-refresh": cmd_injuries_refresh, "injuries-backfill": cmd_injuries_backfill,
             "injuries-status": cmd_injuries_status,
             "odds-status": cmd_odds_status,
             "import-odds": cmd_import_odds, "blend-study": cmd_blend_study, "market-benchmark": cmd_market_benchmark,

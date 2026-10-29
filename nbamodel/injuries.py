@@ -472,3 +472,24 @@ def backfill(con: sqlite3.Connection, games: pd.DataFrame, start: str, end: str,
                 break
         done += 1
     return {"complete": True, "days_done": done, "fetched": fetched, "found": found, "next_day": None}
+
+
+def load_changes(cons, game_dates=None) -> tuple:
+    """(change-log rows, report publication times per game date) from one or more databases
+    (the backfilled history and the live archive), de-duplicated on content. A game date counts
+    as reported from the first report that lists it."""
+    frames, times = [], []
+    for con in cons:
+        where, params = "", []
+        if game_dates is not None:
+            game_dates = list(game_dates)
+            where = f" WHERE game_date IN ({','.join('?' * len(game_dates))})"
+            params = game_dates
+        frames.append(pd.read_sql(f"SELECT game_date, matchup, team, player_key, player_name, status, reason, "
+                                  f"published_at FROM injury_reports{where}", con, params=params))
+        f = pd.read_sql("SELECT published_at, game_dates FROM injury_report_files WHERE parse_status = 'ok'", con)
+        times.append(f.assign(game_date=f["game_dates"].str.split(",")).explode("game_date")[["game_date", "published_at"]])
+    rows = pd.concat(frames, ignore_index=True).drop_duplicates(
+        ["game_date", "matchup", "team", "player_key", "status", "reason", "published_at"])
+    t = pd.concat(times, ignore_index=True).dropna().drop_duplicates()
+    return rows.sort_values(["published_at"], kind="stable"), t.groupby("game_date")["published_at"].min()
