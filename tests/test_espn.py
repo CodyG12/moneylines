@@ -93,7 +93,7 @@ def test_update_scores_validates_and_stores_players_once(tmp_path, monkeypatch):
     monkeypatch.setattr(espn, "scoreboard", lambda day, timeout=30.0: espn.parse_scoreboard(bos_only)
                         if pd.Timestamp(day) == pd.Timestamp("2026-10-27") else espn.parse_scoreboard({}))
 
-    def fake_summary(event_id, game_key=None, timeout=30.0):
+    def fake_summary(event_id, game_key=None, timeout=30.0, variant=0):
         calls.append(event_id)
         if event_id != "401909877":
             raise AssertionError("only the BOS game should need a summary")
@@ -108,3 +108,15 @@ def test_update_scores_validates_and_stores_players_once(tmp_path, monkeypatch):
     monkeypatch.setattr(espn, "summary", lambda *a, **k: pytest.fail("no summary expected"))
     out2, st2 = espn.update(out[out["home_team"] == "BOS"], con, "2026-10-27", "2026-10-27", pause=0)
     assert st2["updated"] == 0 and st2["players"] == 0
+
+
+def test_blank_cached_copy_is_refetched_before_giving_up(monkeypatch):
+    good = espn.parse_summary(SUMMARY, "k")
+    blank = (good[0], good[1].assign(pts=0))
+    served = iter([blank, good])
+    monkeypatch.setattr(espn, "summary", lambda *a, **k: next(served))
+    g = espn.parse_scoreboard({"events": BOARD["events"][:1]}).iloc[0]
+    _, players, problems = espn.validated_summary(g, "k", pause=0)
+    assert problems == [] and players["pts"].sum() == 249
+    monkeypatch.setattr(espn, "summary", lambda *a, **k: blank)
+    assert espn.validated_summary(g, "k", pause=0)[2] != []

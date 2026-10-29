@@ -584,6 +584,23 @@ def cmd_results_update(args, cfg):
     return 0
 
 
+def cmd_players_backfill(args, cfg):
+    raw = pd.read_csv(args.games or cfg["paths"]["games"], comment="#", dtype={"game_id_source": str})
+    end = args.end or (pd.Timestamp.now(tz=espn.ET) - pd.Timedelta(days=1)).date().isoformat()
+    try:
+        with store.connect(args.db) as con:
+            r = espn.backfill(con, raw, args.start, end, args.max_seconds, args.pause)
+            n = con.execute("SELECT COUNT(*), COUNT(DISTINCT espn_event_id) FROM player_games").fetchone()
+            bad = con.execute("SELECT COUNT(*) FROM espn_invalid").fetchone()[0]
+    except espn.EspnError as exc:
+        print(f"player backfill stopped: {exc}", file=sys.stderr)
+        return 12
+    state = "complete" if r["complete"] else f"paused at {r['next_day']}"
+    print(f"player backfill {args.start}..{end}: {state}; this run stored {r['games']} game(s), {r['rows']} rows; "
+          f"{args.db} holds {n[0]} rows over {n[1]} games ({bad} failed validation)")
+    return 0 if r["complete"] else 10
+
+
 def cmd_injuries_refresh(args, cfg):
     games, _, _ = load_games_from(cfg, args.games, None)
     with store.connect(args.db or cfg["paths"]["db"]) as con:
@@ -1007,6 +1024,13 @@ def build_parser():
     ru.add_argument("--start", help="first US/Eastern date (default: --days-back before today)")
     ru.add_argument("--days-back", type=int, default=3)
     ru.add_argument("--days-ahead", type=int, default=7, help="also refresh tip-off times this far ahead")
+    pb = sub.add_parser("players-backfill", help="historical player box scores from ESPN into a separate database")
+    pb.add_argument("--games")
+    pb.add_argument("--db", default="data/player_history.db")
+    pb.add_argument("--start", default="2014-10-28")
+    pb.add_argument("--end", help="last game date (default: yesterday, US/Eastern)")
+    pb.add_argument("--max-seconds", type=float, default=3600)
+    pb.add_argument("--pause", type=float, default=1.0, help="seconds between requests")
     ir = sub.add_parser("injuries-refresh", help="ingest new official NBA injury reports (today's, from the season page)")
     ir.add_argument("--games")
     ir.add_argument("--db", help="database (default from config)")
@@ -1061,7 +1085,7 @@ COMMANDS = {"build-dataset": cmd_build_dataset, "walk-forward": cmd_walk_forward
             "evaluate": cmd_evaluate, "train": cmd_train, "predict": cmd_predict,
             "update-results": cmd_update_results, "dashboard": cmd_dashboard,
             "collect-odds": cmd_collect_odds, "odds-plan": cmd_odds_plan, "odds-next": cmd_odds_next,
-            "results-update": cmd_results_update, "injuries-refresh": cmd_injuries_refresh, "injuries-backfill": cmd_injuries_backfill,
+            "results-update": cmd_results_update, "players-backfill": cmd_players_backfill, "injuries-refresh": cmd_injuries_refresh, "injuries-backfill": cmd_injuries_backfill,
             "injuries-status": cmd_injuries_status,
             "odds-status": cmd_odds_status,
             "import-odds": cmd_import_odds, "blend-study": cmd_blend_study, "market-benchmark": cmd_market_benchmark,

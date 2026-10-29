@@ -138,6 +138,12 @@ CREATE TABLE IF NOT EXISTS player_games (
 );
 CREATE INDEX IF NOT EXISTS player_games_player ON player_games (player_id, game_date);
 CREATE INDEX IF NOT EXISTS player_games_team ON player_games (team, game_date);
+CREATE TABLE IF NOT EXISTS espn_fetch_log (
+    game_date TEXT PRIMARY KEY, n_events INTEGER, n_stored INTEGER, n_invalid INTEGER, fetched_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS espn_invalid (
+    espn_event_id TEXT PRIMARY KEY, game_date TEXT, reason TEXT, checked_at TEXT NOT NULL
+);
 """
 
 
