@@ -574,11 +574,16 @@ re-enable it in the Actions tab.
 
 ## Phase 4: injury-aware predictions (in progress)
 
-Built in milestones. Done: **1. official injury report ingestion**, **2a. ESPN results and
-current-season player box scores** (see Hosted collection) and **2b. the player box-score history
-backfill** (below). Next: player-impact features, an injury-aware model comparison with calibration, a
-risk-adjusted opportunity ranking, and the upgraded `make today`. Until those land, injuries and
-player box scores are archived but not used by the model.
+Built in milestones. Done:
+- **1.** official injury report ingestion
+- **2a.** ESPN results and current-season player box scores (see Hosted collection)
+- **2b.** the player box-score history backfill
+- **3 (core).** player-impact features, computed but not yet fed to a model
+- **5/6.** the risk-adjusted opportunity ranking in `make today`
+
+Next: **4.** the injury-aware model comparison with calibration, then **7.** the selection backtest
+on live prices. Until milestone 4, the model's probabilities do not use injuries; the report uses
+injuries only as risk controls.
 
 ### Official injury reports (`nbamodel/injuries.py`)
 
@@ -663,6 +668,68 @@ scripts/state_sync.sh pull-history player           # local copy
 python -m nbamodel players-backfill --db data/player_history.db --start ... --end ... [--max-seconds N]
 ```
 
+### Player-impact features (`nbamodel/player_impact.py`)
+
+Each feature is the change in a team's expected margin versus its recent form, given the injury
+report at prediction time. In points: `impact = sum_i (r_i - r_rep) * (P_i * healthy_i - recent_i) / 48`.
+- `r_i` is the player's rating: game-level regularized plus-minus. Ridge shrinks each player toward
+  a prior based on his minutes per game, so the deep bench is not pulled up to league average.
+  Ratings are refit every Monday from earlier games only.
+- `r_rep` is replacement level: the rating of low-minute players.
+- `healthy_i` is the player's average minutes over his last 10 games played. `recent_i` is his
+  average minutes over his team's last 10 games, counting 0 when he didn't play. That 10-game
+  window is the one the team features use.
+- `P_i` is P(plays | report status), measured on earlier seasons by matching statuses to box
+  scores. A player who was never listed counts as `unlisted`, which is also a measured rate.
+
+Because the feature is a change versus recent form, a long absence counts about 0: it is already in
+the team's numbers. A newly absent or returning player moves it. `impact_sd` carries the
+uncertainty from questionable players. Games with no report before prediction time get NaN, never
+"healthy".
+
+### Opportunity ranking (`nbamodel/opportunities.py`, `make today` sections B to D)
+
+For each game, `make today` takes the side with the better expected value at the latest price and
+computes:
+- `expected ROI = p x decimal_odds - 1`
+- `conservative ROI = p_lower x decimal_odds - 1`
+
+`p_lower` is `p` minus the model's measured calibration shortfall for similar predictions. In each
+probability band (early season and later season separately) it is the gap between the average
+prediction and an 80% one-sided lower bound on how often those picks actually won. The table
+(`config/uncertainty.json`, built by `python -m nbamodel uncertainty-fit`) uses development
+walk-forward predictions only: 10,749 games from 2016-10 to 2025-04, never the final holdout.
+It shows mild overconfidence on big favourites (85%+ predicted, 85.6% observed) and a lot of it
+early in the season (75 to 85% predicted, shortfall of 9 to 13 points). That is why a 70 to 80%
+pick is not treated as low-risk.
+
+Only games that pass every check are ranked, by conservative ROI. The market price is used only to
+price the bet; it is never a model input. Every other game is listed under GAMES TO AVOID with all
+of its reasons. When nothing qualifies, the report says **NO QUALIFYING OPPORTUNITIES TODAY**.
+
+Settings (`config/phase2.json` -> `opportunities`). None of these were tuned on the final holdout.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `min_edge` | 0.02 | model minus no-vig probability for the selected side |
+| `min_expected_roi` | 0.02 | same as the paper ledger's `ev_threshold` |
+| `min_conservative_roi` | 0.0 | `p_lower x odds - 1` must be non-negative |
+| `max_abs_edge` | 0.10 | Phase 3's `edge_too_large` abstention, kept: a bigger gap usually means missing information |
+| `max_odds_age_minutes` | 60 | stale price |
+| `max_injury_report_age_minutes` | 180 | stale injury report |
+| `max_model_spread` | 0.20 | the model's components disagree |
+| `early_season_games`, `early_season_extra_roi` | 10, 0.02 | either team under 10 games needs 2 more points of conservative ROI |
+| `rotation_minutes` | 20 | important player: at least 20 healthy minutes this season |
+| `block_unresolved_injuries` | true | a rotation player questionable or doubtful: not eligible |
+| `block_missing_injury_report` | true | no report yet, a team not submitted, or no box scores to judge importance: not eligible |
+| `kelly_multiplier`, `max_stake_fraction` | 0.25, 0.02 | paper stake: quarter Kelly on `p_lower`, at most 2% of bankroll |
+| `max_daily_exposure` | 0.10 | at most 10% of bankroll across the day's selections |
+| `max_selections_per_team` | 1 | correlated exposure: one selection per team per day |
+| `validated_edge` | false | while false, the summary warns that no edge has been shown |
+
+API costs: none new. The ranking reads the odds archive. `make today` never calls The Odds API;
+it runs `--no-refresh --no-log`.
+
 ## Layout
 
 ```
@@ -698,6 +765,8 @@ nbamodel/
   paper.py                live paper-trading ledger (decisions, settlement, bankroll)
   injuries.py             official NBA injury reports: fetch, parse, append-only change log
   espn.py                 ESPN results, tip-off times and player box scores (validated)
+  player_impact.py        player ratings, minutes, availability probabilities, injury features
+  opportunities.py        conservative probabilities, risk controls, ranking, no-bet outcome
   cli.py, __main__.py     `python -m nbamodel ...`
 config/phase2.json        settings (Phase 3 adds the odds, paper and blend sections)
 Makefile                  reproducible commands

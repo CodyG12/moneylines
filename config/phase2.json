@@ -99,5 +99,25 @@
   },
   "blend": {
     "base_col": "p_logistic_raw"
+  },
+  "opportunities": {
+    "uncertainty_table": "config/uncertainty.json",
+    "min_edge": 0.02,
+    "min_expected_roi": 0.02,
+    "min_conservative_roi": 0.0,
+    "max_abs_edge": 0.1,
+    "max_odds_age_minutes": 60,
+    "max_injury_report_age_minutes": 180,
+    "max_model_spread": 0.2,
+    "early_season_games": 10,
+    "early_season_extra_roi": 0.02,
+    "rotation_minutes": 20,
+    "block_unresolved_injuries": true,
+    "block_missing_injury_report": true,
+    "kelly_multiplier": 0.25,
+    "max_stake_fraction": 0.02,
+    "max_daily_exposure": 0.1,
+    "max_selections_per_team": 1,
+    "validated_edge": false
   }
 }
