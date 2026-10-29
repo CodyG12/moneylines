@@ -120,3 +120,27 @@ def test_blank_cached_copy_is_refetched_before_giving_up(monkeypatch):
     assert problems == [] and players["pts"].sum() == 249
     monkeypatch.setattr(espn, "summary", lambda *a, **k: blank)
     assert espn.validated_summary(g, "k", pause=0)[2] != []
+
+
+def test_truncated_response_is_retried(monkeypatch):
+    import http.client
+    import io
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    replies = iter([http.client.IncompleteRead(b"{"), Resp(b'{"events": []}')])
+
+    def fake_urlopen(req, timeout=30.0):
+        r = next(replies)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    monkeypatch.setattr(espn.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(espn.time, "sleep", lambda s: None)
+    assert espn._get(f"{espn.BASE_URL}/scoreboard?dates=20261027") == {"events": []}

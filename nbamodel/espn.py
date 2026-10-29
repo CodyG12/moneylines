@@ -17,6 +17,7 @@ before the prediction time; they never stand in for a pregame injury report.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import time
@@ -63,7 +64,7 @@ def _get(url: str, timeout: float = 30.0, retries: int = 4, variant: int = 0) ->
             if not body:
                 raise ValueError("empty response")
             return json.loads(body)
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:  # incl. truncated bodies
             last = exc
             time.sleep(min(2 ** attempt, 8))
     raise EspnError(f"ESPN request failed: {url}: {last}")
