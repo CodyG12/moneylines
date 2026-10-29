@@ -125,6 +125,34 @@ CREATE INDEX IF NOT EXISTS injury_reports_date ON injury_reports (game_date, pub
 CREATE INDEX IF NOT EXISTS injury_reports_game ON injury_reports (game_key, team, published_at);
 """
 
+# Player box scores (nbamodel/espn.py), one row per player per game. Post-game facts: features
+# only read games that finished before the prediction time.
+PLAYER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS player_games (
+    espn_event_id TEXT NOT NULL, player_id TEXT NOT NULL, game_key TEXT, game_date TEXT NOT NULL,
+    team TEXT NOT NULL, opponent TEXT, home INTEGER, player_name TEXT, starter INTEGER, did_not_play INTEGER,
+    dnp_reason TEXT, minutes REAL, pts INTEGER, fgm INTEGER, fga INTEGER, fg3m INTEGER, fg3a INTEGER,
+    ftm INTEGER, fta INTEGER, oreb INTEGER, dreb INTEGER, reb INTEGER, ast INTEGER, stl INTEGER, blk INTEGER,
+    tov INTEGER, pf INTEGER, plus_minus INTEGER, source TEXT NOT NULL DEFAULT 'espn', fetched_at TEXT,
+    PRIMARY KEY (espn_event_id, player_id)
+);
+CREATE INDEX IF NOT EXISTS player_games_player ON player_games (player_id, game_date);
+CREATE INDEX IF NOT EXISTS player_games_team ON player_games (team, game_date);
+"""
+
+
+def log_player_games(con: sqlite3.Connection, rows: pd.DataFrame) -> int:
+    """Append player box rows; a (game, player) already stored is left as it was."""
+    if rows.empty:
+        return 0
+    cols = [c for c in rows.columns if c != "source"]
+    before = con.total_changes
+    con.executemany(f"INSERT OR IGNORE INTO player_games ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                    [tuple(_none(v) for v in r) for r in rows[cols].itertuples(index=False)])
+    con.commit()
+    return con.total_changes - before
+
+
 # Component probabilities logged next to the published one, so every model can be benchmarked
 # against the market on exactly the same games and timestamps. Added to old databases in place.
 COMPONENT_COLUMNS = ("p_elo", "p_logistic", "p_logistic_raw", "p_gbm", "p_gbm_raw", "p_ensemble", "p_blend")
@@ -138,6 +166,7 @@ def connect(path=DEFAULT_DB) -> sqlite3.Connection:
     con.executescript(SCHEMA)
     con.executescript(PHASE3_SCHEMA)
     con.executescript(INJURY_SCHEMA)
+    con.executescript(PLAYER_SCHEMA)
     if "game_dates" not in {r[1] for r in con.execute("PRAGMA table_info(injury_report_files)")}:
         con.execute("ALTER TABLE injury_report_files ADD COLUMN game_dates TEXT")
     have = {r[1] for r in con.execute("PRAGMA table_info(predictions)")}

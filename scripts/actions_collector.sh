@@ -1,7 +1,8 @@
 #!/bin/bash
 # Hosted collector, run by .github/workflows/collector.yml (one run at a time). Restores the
 # encrypted state, then every 5 minutes:
-#   1. scores results the Mac pushed to the results branch (update-results --retrain-if-due),
+#   1. once a day after 10:00 UTC (all NBA games are final by then): takes scores, tip-off times and
+#      player box scores from ESPN (results-update), then reconciles (update-results --retrain-if-due),
 #   2. ingests new official injury reports,
 #   3. collects odds if a snapshot target is due, then logs predictions and paper decisions,
 #   4. pushes the state branch when anything changed.
@@ -16,25 +17,28 @@ stop=$(( $(date +%s) + ${COLLECTOR_SECONDS:-20400} ))   # 5h40m, inside the job'
 stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 $SYNC pull-state || exit 1
+# The games file lives in the state. Before it did, the Mac pushed it to the results branch.
+if [ ! -f data/raw/nba_games.csv ] && ! $SYNC pull-results >/dev/null; then
+  echo "$(stamp) no games file in the state or on the results branch; cannot collect" >&2
+  exit 1
+fi
 mkdir -p "$LOG"
 last_failed=0
 while :; do
   changed=0
-  if sha=$($SYNC pull-results); then
-    # Retry a failed reconcile at most once an hour.
-    if [ "$sha" != "$(cat "$LOG/results_sha" 2>/dev/null)" ] && [ $(( $(date +%s) - last_failed )) -ge 3600 ]; then
-      changed=1
-      echo "=== $(stamp) reconcile (results ${sha:0:12})" >> "$LOG/reconcile.log"
-      if "${NBA[@]}" update-results --retrain-if-due >> "$LOG/reconcile.log" 2>&1; then
-        echo "$sha" > "$LOG/results_sha"
-        [ -n "${RECONCILED_FLAG:-}" ] && touch "$RECONCILED_FLAG"
-      else
-        last_failed=$(date +%s)
-      fi
+  # Daily reconcile, retried at most once an hour.
+  done_today="$LOG/.reconciled-$(date -u +%Y-%m-%d)"
+  if [ "$(date -u +%H)" -ge 10 ] && [ ! -e "$done_today" ] && [ $(( $(date +%s) - last_failed )) -ge 3600 ]; then
+    changed=1
+    echo "=== $(stamp) daily reconcile" >> "$LOG/reconcile.log"
+    if "${NBA[@]}" results-update >> "$LOG/reconcile.log" 2>&1 \
+       && "${NBA[@]}" update-results --retrain-if-due >> "$LOG/reconcile.log" 2>&1; then
+      find "$LOG" -name '.reconciled-*' -mtime +7 -delete 2>/dev/null
+      touch "$done_today"
+      [ -n "${RECONCILED_FLAG:-}" ] && touch "$RECONCILED_FLAG"
+    else
+      last_failed=$(date +%s)
     fi
-  elif [ ! -f data/raw/nba_games.csv ]; then
-    echo "$(stamp) no results file; cannot collect" >&2
-    exit 1
   fi
 
   # Official injury reports (free; new files only). Each new report is a change to keep.

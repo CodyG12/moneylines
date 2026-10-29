@@ -1,9 +1,11 @@
 #!/bin/bash
 # Encrypted state for hosted collection, kept on two single-writer orphan branches. The repo is
 # public, so only ciphertext is ever pushed.
-#   state:   written only by the GitHub Actions collector: data/predictions.db, model artifacts, the
-#            walk-forward reference report, the latest upcoming-predictions CSV and logs/actions/.
-#   results: written only by the Mac (stats.nba.com blocks GitHub's runners): data/raw/nba_games.csv.
+#   state:   written only by the GitHub Actions collector: data/predictions.db, the games file
+#            (data/raw/nba_games.csv, updated from ESPN), model artifacts, the walk-forward reference
+#            report, the latest upcoming-predictions CSV and logs/actions/.
+#   results: the games file as the Mac last pushed it (stats.nba.com era). Read once to bootstrap a
+#            state that has no games file; nothing writes it any more.
 #   injury-history: written only by the injury-backfill workflow: data/injury_history.db (official
 #            injury reports from 2019-20 on; kept apart because it is large and rarely changes).
 # Each push replaces the branch with one new commit, so the branches never accumulate history.
@@ -20,7 +22,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REMOTE=${STATE_REMOTE:-origin}
 PY=${PY:-.venv/bin/python}
-STATE_PATHS=(artifacts out/walkforward/report.json out/upcoming_predictions.csv logs/actions)
+STATE_PATHS=(data/raw/nba_games.csv artifacts out/walkforward/report.json out/upcoming_predictions.csv logs/actions)
 
 if [ -z "${STATE_KEY:-}" ] && [ -f .env ]; then
   STATE_KEY=$(sed -n 's/^STATE_KEY=//p' .env | tail -1 | tr -d "'\"")

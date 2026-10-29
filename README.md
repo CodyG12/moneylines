@@ -164,6 +164,7 @@ Elo hyperparameters (K=20, HCA=100, carryover 0.75) are fixed defaults, not tune
 | source | what | cost / constraints |
 |---|---|---|
 | [`nba_api`](https://github.com/swar/nba_api) (stats.nba.com) | game results, box scores, team/player stats | Free. Unofficial wrapper of an undocumented site API. NBA.com terms limit use to personal, non-commercial purposes. Rate-limit your requests and don't redistribute the data. |
+| [ESPN public API](https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard) | live results, team and player box scores (hosted collector) | Free, unofficial and undocumented; it can change without notice. Personal, non-commercial use; requests are spaced out. |
 | [The Odds API](https://the-odds-api.com) | timestamped bookmaker moneylines | Free plan: current odds at 1 credit per call, with a small monthly quota. **Historical** snapshots (from June 2020, 5 to 10 minute granularity) need a paid plan at 10 credits per call. Check their terms before redistributing data. |
 | Community CSV datasets (Kaggle, GitHub) | historical results, sometimes odds | Check each dataset's license. Odds archives often lack quote timestamps or mix opening and closing lines, so verify them before backtesting. |
 
@@ -523,28 +524,36 @@ always-on machine (a small VPS or a Raspberry Pi) with the repo, `.venv`, `.env`
 
 ### Hosted collection (GitHub Actions)
 
-So collection keeps running while the Mac sleeps, `.github/workflows/collector.yml` runs it on
-GitHub's runners and the Mac only supplies results.
+So collection keeps running while the Mac sleeps, `.github/workflows/collector.yml` runs
+everything on GitHub's runners. The Mac has no scheduled job.
 
 - **Collector:** started every 30 minutes, one run at a time (the next run waits in the queue).
-  Each run (`scripts/actions_collector.sh`) restores the state, then every 5 minutes scores new
-  results, runs `collect-odds --then-predict` and pushes the state when anything changed. It ends
-  after 5h40m, or early when no snapshot target opens within 6 hours (`python -m nbamodel
+  Each run (`scripts/actions_collector.sh`) restores the state, then every 5 minutes it ingests new
+  injury reports, runs `collect-odds --then-predict`, and pushes the state when anything changed.
+  It ends after 5h40m, or early when no snapshot target opens within 6 hours (`python -m nbamodel
   odds-next`). GitHub often starts scheduled runs late, so a run that is already polling covers the
   15-minute targets.
-- **Results come from the Mac:** stats.nba.com does not answer GitHub's runners (tested
-  2026-10-28: every request timed out). `scripts/results_cron.sh` runs `make data-update` once a
-  day after 10:00 UTC, or on the next wake, and pushes the games CSV. If the Mac stays off,
-  scoring waits. Odds collection does not.
-- **State is encrypted:** the repo is public, so the `state` branch (database, models,
-  walk-forward report, upcoming predictions, `logs/actions/`) and the `results` branch (games CSV)
-  only hold AES-256 ciphertext (`scripts/state_sync.sh`). Each push replaces the branch with a
-  single commit. Each run that reconciles also uploads the encrypted state as a 14-day artifact.
-  Each branch has one writer: the collector writes `state` and the Mac writes `results`.
-- **Read-only on the Mac:** `make pull` replaces `data/predictions.db`, `artifacts/` and
-  `logs/actions/` with the collector's copy and rebuilds the dashboard. Disconnect DBCode first;
-  the script refuses while the file is open. Anything written to the local database is
-  overwritten on the next pull.
+- **Results from ESPN:** once a day after 10:00 UTC (retried at most hourly), `results-update`
+  takes final scores, team box stats, tip-off times for the next 7 days and player box scores
+  from ESPN's public API (`nbamodel/espn.py`). Then `update-results --retrain-if-due` reconciles.
+  stats.nba.com does not answer GitHub's runners and timed out from home connections on
+  2026-10-28/29. ESPN answers both.
+  - Cross-checked on 2026-10-29 against stats.nba.com for all 56 games from 2026-10-20 to
+    2026-10-27: scores, FGM, FGA, 3PM, FTA, OREB, DREB and turnovers all match.
+  - Every game must pass validation (player points add up to the team score) before it is scored.
+  - A score already in the games file is never overwritten; a mismatch is logged.
+  - ESPN's API is unofficial and undocumented. It sometimes serves empty responses, which are
+    retried with different query parameters.
+- **State is encrypted:** the repo is public, so the `state` branch (database, games file, models,
+  walk-forward report, upcoming predictions, `logs/actions/`) only holds AES-256 ciphertext
+  (`scripts/state_sync.sh`). Each push replaces the branch with a single commit. Each run that
+  reconciles also uploads the encrypted state as a 14-day artifact. Only the collector writes
+  `state`. The older `results` branch (the games file the Mac pushed in the stats.nba.com era) is
+  only read once, to bootstrap a state that has no games file.
+- **Read-only on the Mac:** `make pull` replaces `data/predictions.db`, the games file,
+  `artifacts/` and `logs/actions/` with the collector's copy and rebuilds the dashboard. Disconnect
+  DBCode first; the script refuses while the file is open. Anything written locally is overwritten
+  on the next pull.
 
 One-time setup:
 
@@ -552,22 +561,24 @@ One-time setup:
 openssl rand -base64 32                  # put it in .env as STATE_KEY=...
 gh secret set STATE_KEY                  # paste the same value
 gh secret set ODDS_API_KEY               # paste the Odds API key
-scripts/install_results_schedule.sh      # stops local odds collection, installs the results push
-make seed-state                          # upload this Mac's database, models and results
+scripts/install_odds_schedule.sh --uninstall   # stop local odds collection, if it was installed
+make seed-state                          # upload this Mac's database, games file and models
 gh workflow run collector -f check_only=true   # restore + status only; then let the schedule run
 ```
 
-To go back to local collection: `gh workflow disable collector`, `make pull`, then
-`scripts/install_results_schedule.sh --uninstall` and `scripts/install_odds_schedule.sh`.
-GitHub disables scheduled workflows after 60 days without repository activity. The Mac's daily
-results push should count as activity. If the schedule does get disabled, re-enable it in the
-Actions tab.
+The retired Mac results job is removed with `scripts/install_results_schedule.sh --uninstall`. To
+go back to local collection: `gh workflow disable collector`, `make pull`, then
+`scripts/install_odds_schedule.sh`. GitHub disables scheduled workflows after 60 days without
+repository activity, and the collector's pushes may not count. If the schedule gets disabled,
+re-enable it in the Actions tab.
 
 ## Phase 4: injury-aware predictions (in progress)
 
-Built in milestones. Done: **1. official injury report ingestion.** Next: player data, player-impact
-features, an injury-aware model comparison with calibration, a risk-adjusted opportunity ranking,
-and the upgraded `make today`. Until those land, injuries are archived but not used by the model.
+Built in milestones. Done: **1. official injury report ingestion** and **2a. ESPN results and
+current-season player box scores** (see Hosted collection). Next: the player box-score history
+backfill, player-impact features, an injury-aware model comparison with calibration, a
+risk-adjusted opportunity ranking, and the upgraded `make today`. Until those land, injuries and
+player box scores are archived but not used by the model.
 
 ### Official injury reports (`nbamodel/injuries.py`)
 
@@ -662,6 +673,7 @@ nbamodel/
   clv.py                  price-based closing-line value
   paper.py                live paper-trading ledger (decisions, settlement, bankroll)
   injuries.py             official NBA injury reports: fetch, parse, append-only change log
+  espn.py                 ESPN results, tip-off times and player box scores (validated)
   cli.py, __main__.py     `python -m nbamodel ...`
 config/phase2.json        settings (Phase 3 adds the odds, paper and blend sections)
 Makefile                  reproducible commands
