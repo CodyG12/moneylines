@@ -146,6 +146,38 @@ def test_truncated_response_is_retried(monkeypatch):
     assert espn._get(f"{espn.BASE_URL}/scoreboard?dates=20261027") == {"events": []}
 
 
+def _summary_without_athlete_id(did_not_play):
+    data = json.loads(json.dumps(SUMMARY))
+    athletes = [a for team in data["boxscore"]["players"] for block in team["statistics"] for a in block["athletes"]]
+    a = next(x for x in athletes if bool(x.get("didNotPlay")) == did_not_play)
+    a["athlete"] = {"links": [], "shortName": a["athlete"].get("shortName")}
+    return data, len(athletes)
+
+
+def test_player_who_did_not_play_and_has_no_espn_id_is_left_out():
+    data, n_athletes = _summary_without_athlete_id(did_not_play=True)
+    _, players = espn.parse_summary(data, "k")
+    assert len(players) == n_athletes - 1
+    assert players.groupby("team")["pts"].sum().to_dict() == {"BKN": 124, "BOS": 125}
+
+
+def test_blank_stat_line_with_no_espn_id_is_left_out_even_if_not_marked_dnp():
+    data = json.loads(json.dumps(SUMMARY))
+    team = data["boxscore"]["players"][0]
+    block = team["statistics"][0]
+    a = next(x for x in block["athletes"] if x.get("didNotPlay"))
+    a.update(didNotPlay=False, athlete={"links": [], "shortName": "Stub"},
+             stats=["--" if k == "minutes" else "0-0" if "-" in k else "0" for k in block["keys"]])
+    n = espn.parse_summary(SUMMARY, "k")[1].shape[0]
+    assert espn.parse_summary(data, "k")[1].shape[0] == n - 1
+
+
+def test_player_who_played_and_has_no_espn_id_is_not_dropped_silently():
+    data, _ = _summary_without_athlete_id(did_not_play=False)
+    with pytest.raises(KeyError):
+        espn.parse_summary(data, "k")
+
+
 def _stripped_board():
     event = {k: v for k, v in BOARD["events"][0].items() if k != "competitions"}
     return {"events": [event, *BOARD["events"][1:]]}

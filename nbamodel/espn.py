@@ -138,6 +138,9 @@ def parse_summary(data: dict, game_key: str | None = None, fetched_at: str | Non
                 fg3m, fg3a = _made_att(st.get("threePointFieldGoalsMade-threePointFieldGoalsAttempted"))
                 ftm, fta = _made_att(st.get("freeThrowsMade-freeThrowsAttempted"))
                 dnp = bool(a.get("didNotPlay")) or not st
+                if "id" not in a["athlete"] and set(st.values()) <= {"0", "0-0", "--"}:
+                    continue   # stub with only a shortName (Olbrich, CHI, 43 games in 2025-26). His line can be
+                    #            blanked in games he played: validate_game rejects those if he scored
                 rows.append({
                     "game_key": game_key, "espn_event_id": event_id, "game_date": day, "team": abbr[ha],
                     "opponent": abbr["away" if ha == "home" else "home"], "home": int(ha == "home"),
