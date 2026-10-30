@@ -172,8 +172,19 @@ def validate_game(final_scores: dict, players: pd.DataFrame) -> list:
 
 
 # ------------------------------------------------------------------ fetching
-def scoreboard(day, timeout: float = 30.0) -> pd.DataFrame:
-    return parse_scoreboard(_get(f"{BASE_URL}/scoreboard?dates={pd.Timestamp(day):%Y%m%d}", timeout))
+def scoreboard(day, timeout: float = 30.0, tries: int = 3) -> pd.DataFrame:
+    """A copy with events cut down to stubs (seen on 2025-01-15, fine when refetched) is fetched
+    again with different query parameters. Never skip such an event: callers log the day as done,
+    so its games would be lost for good."""
+    last = None
+    for k in range(tries):
+        data = _get(f"{BASE_URL}/scoreboard?dates={pd.Timestamp(day):%Y%m%d}", timeout, variant=k)
+        try:
+            return parse_scoreboard(data)
+        except (KeyError, IndexError, TypeError) as exc:
+            last = exc
+            time.sleep(min(2 ** k, 8))
+    raise EspnError(f"ESPN scoreboard for {pd.Timestamp(day).date()} unreadable after {tries} tries: {last!r}")
 
 
 def summary(event_id: str, game_key: str | None = None, timeout: float = 30.0, variant: int = 0) -> tuple:

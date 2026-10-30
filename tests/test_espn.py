@@ -144,3 +144,33 @@ def test_truncated_response_is_retried(monkeypatch):
     monkeypatch.setattr(espn.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(espn.time, "sleep", lambda s: None)
     assert espn._get(f"{espn.BASE_URL}/scoreboard?dates=20261027") == {"events": []}
+
+
+def _stripped_board():
+    event = {k: v for k, v in BOARD["events"][0].items() if k != "competitions"}
+    return {"events": [event, *BOARD["events"][1:]]}
+
+
+def test_stripped_scoreboard_copy_is_refetched_with_other_query_params(monkeypatch):
+    variants = []
+    served = iter([_stripped_board(), BOARD])
+
+    def fake_get(url, timeout=30.0, retries=4, variant=0):
+        variants.append(variant)
+        return next(served)
+
+    monkeypatch.setattr(espn, "_get", fake_get)
+    monkeypatch.setattr(espn.time, "sleep", lambda s: None)
+    assert len(espn.scoreboard("2026-10-27")) == len(BOARD["events"])
+    assert variants == [0, 1]
+
+
+def test_unreadable_scoreboard_stops_backfill_without_marking_the_day_done(tmp_path, monkeypatch):
+    con = store.connect(tmp_path / "p.db")
+    monkeypatch.setattr(espn, "_get", lambda *a, **k: _stripped_board())
+    monkeypatch.setattr(espn.time, "sleep", lambda s: None)
+    raw = pd.DataFrame([{"date": "2026-10-27", "home_team": "BOS", "away_team": "NYK",
+                         "home_score": 100, "game_id_source": "x"}])
+    with pytest.raises(espn.EspnError, match="2026-10-27"):
+        espn.backfill(con, raw, "2026-10-27", "2026-10-27", pause=0)
+    assert con.execute("SELECT COUNT(*) FROM espn_fetch_log").fetchone()[0] == 0
