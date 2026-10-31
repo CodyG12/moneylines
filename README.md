@@ -687,6 +687,39 @@ the team's numbers. A newly absent or returning player moves it. `impact_sd` car
 uncertainty from questionable players. Games with no report before prediction time get NaN, never
 "healthy".
 
+### Injury-aware model comparison (`nbamodel/availability_study.py`, `make availability-study`)
+
+`attach_availability` adds `injury_impact_diff`, `injury_impact_sd`, `rotation_out_diff`,
+`rotation_uncertain_diff` and `report_available` to the dataset (`build-dataset --availability`).
+They are not in `FEATURES_V2`, so production models and `make today` do not use them yet. The study
+needs `scripts/state_sync.sh pull-history injury` and `pull-history player`. Building the features
+takes about 30 minutes and is cached in `data/processed/availability_features.csv`; `--rebuild-features`
+recomputes them.
+
+Results on development games only (generated 2026-10-31): 6,850 games, 2019-11-20 to 2025-04-13, with
+both teams' reports published before the prediction time. Log-loss differences are against the
+current champion, with date-clustered 95% CIs.
+
+| Model | Log loss | Brier | Accuracy | ECE | Diff vs champion |
+|---|---:|---:|---:|---:|---|
+| A logistic, uncalibrated (champion) | 0.6262 | 0.2183 | 0.648 | 0.020 | |
+| A early-only Elo blend | 0.6259 | 0.2182 | 0.650 | 0.023 | -0.0003 [-0.0011, +0.0004] |
+| B +injury, uncalibrated | 0.6208 | 0.2159 | 0.659 | 0.017 | -0.0054 [-0.0075, -0.0030] |
+| C +injury, Platt | 0.6234 | 0.2167 | 0.657 | 0.013 | -0.0028 [-0.0061, +0.0007] |
+| C +injury, isotonic | 0.6788 | 0.2207 | 0.654 | 0.029 | +0.0526 [+0.0371, +0.0698] |
+| D +injury, early-only Elo blend | 0.6205 | 0.2158 | 0.658 | 0.016 | -0.0057 [-0.0078, -0.0035] |
+| E gradient boosting +injury | 0.6251 | 0.2176 | 0.654 | 0.013 | -0.0011 [-0.0039, +0.0017] |
+
+The rule committed before the run (lowest log loss, CI below 0, not worse early in the season) selects
+D. What that does and does not show:
+- Follow-up checks on the logistic model: injury features without `report_available` still gain -0.0045
+  [-0.0067, -0.0024], and shuffling them between games removes the gain (+0.0012 [-0.0002, +0.0026]).
+- `report_available` is 0 for every game before November 2019, so it also acts as a marker of the
+  later, lower home-win rate. Remove it before production use.
+- The gain is against the model without injury data, not the market. Injury news is public and priced,
+  and these games have no historical prices, so this is no evidence of a betting edge.
+- The gain is largest in late-season and injury-heavy games. The final holdout was not used.
+
 ### Opportunity ranking (`nbamodel/opportunities.py`, `make today` sections B to D)
 
 For each game, `make today` takes the side with the better expected value at the latest price and
