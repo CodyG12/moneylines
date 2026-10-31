@@ -117,7 +117,8 @@ class LogisticModel:
     selection: dict = field(default_factory=dict)
 
     def _make(self, C):
-        return make_pipeline(SimpleImputer(strategy="median"), StandardScaler(),
+        # keep_empty_features: availability columns are all NaN in windows before the first report
+        return make_pipeline(SimpleImputer(strategy="median", keep_empty_features=True), StandardScaler(),
                              LogisticRegression(C=C, max_iter=2000))
 
     def fit(self, train: pd.DataFrame):
@@ -151,7 +152,7 @@ GBM_GRID = (
     {"learning_rate": 0.02, "max_iter": 400, "max_leaf_nodes": 16, "min_samples_leaf": 300, "l2_regularization": 5.0},
 )
 # Constrain features whose direction is not in doubt (higher = better for the home team).
-MONOTONE_INCREASING = ("elo_diff", "adj_margin_diff", "home_off_vs_away_def")
+MONOTONE_INCREASING = ("elo_diff", "adj_margin_diff", "home_off_vs_away_def", "injury_impact_diff")
 MONOTONE_DECREASING = ("away_off_vs_home_def",)
 
 

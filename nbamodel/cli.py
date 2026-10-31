@@ -36,10 +36,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import blend, clv, espn, injuries, market, opportunities, odds_collect, odds_schedule, odds_store, paper, plots, registry, store
+from . import availability_study, blend, clv, espn, injuries, market, opportunities, odds_collect, odds_schedule, odds_store, paper, player_impact, plots, registry, store
 from .backtest import BettingConfig, paper_trade
 from .data import DataError, prepare_games
-from .dataset import DatasetConfig, build_training_dataset
+from .dataset import DatasetConfig, attach_availability, build_training_dataset
 from .elo import EloConfig, compute_elo
 from .evaluation import compare_log_loss, expected_calibration_error, per_game_log_loss
 from .features import FEATURES_V2, build_features
@@ -126,6 +126,9 @@ def cmd_build_dataset(args, cfg):
     games, report, _ = load_games_from(cfg, args.games, args.odds, args.book)
     dsc = ds_config(cfg)
     ds = build_training_dataset(games, dsc)
+    if args.availability:
+        ds = attach_availability(ds, _availability_rows(cfg, ds))
+        print(f"availability features: {int(ds['report_available'].sum())} games with both teams' reports")
     leaks = find_leaking_features(games, lambda g: build_features(g, dsc.elo, dsc.window), FEATURES_V2)
     suspicious = suspicious_label_correlation(ds, FEATURES_V2)
     if leaks or suspicious:
@@ -701,6 +704,72 @@ def cmd_import_odds(args, cfg):
     return 0
 
 
+def _availability_rows(cfg, ds: pd.DataFrame, rebuild: bool = False) -> pd.DataFrame:
+    """Availability features for played games, from the injury and player histories. Slow (weekly
+    rating refits), so the result is cached; a cached file is reused until --rebuild-features."""
+    path = Path(cfg["paths"].get("availability_features", "data/processed/availability_features.csv"))
+    if path.exists() and not rebuild:
+        f = pd.read_csv(path, dtype={"game_key": str})
+        when = pd.Timestamp(path.stat().st_mtime, unit="s", tz="UTC")
+        print(f"using cached availability features ({len(f)} games, built {when:%Y-%m-%d %H:%M} UTC): {path}")
+        return f
+    live = [Path(cfg["paths"]["db"])] if Path(cfg["paths"]["db"]).exists() else []
+    for p in ("data/injury_history.db", "data/player_history.db"):
+        if not Path(p).exists():
+            raise DataError(f"{p} not found: run scripts/state_sync.sh pull-history injury|player")
+    with store.connect("data/injury_history.db") as hist:
+        live_cons = [store.connect(p) for p in live]
+        changes, first = injuries.load_changes([hist, *live_cons])
+    with store.connect("data/player_history.db") as hist:
+        pg = player_impact.load_player_games([hist, *live_cons])
+    for con in live_cons:
+        con.close()
+    f = player_impact.dataset_features(ds[ds["played"]], changes, first, pg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f.to_csv(path, index=False, float_format="%.6f")
+    print(f"built availability features for {len(f)} games ({int(f['report_available'].sum())} with both reports): {path}")
+    return f
+
+
+def cmd_availability_study(args, cfg):
+    games, _, _ = load_games_from(cfg)
+    ds = build_training_dataset(games, ds_config(cfg))
+    ds = attach_availability(ds, _availability_rows(cfg, ds, args.rebuild_features))
+    if args.features_only:
+        return 0
+    ev = cfg["evaluation"]
+    rep, covered = availability_study.run(games, ds, wf_config(cfg), ev["n_boot"], ev["seed"])
+    outdir = Path(args.out or cfg["paths"].get("availability_dir", "out/availability"))
+    outdir.mkdir(parents=True, exist_ok=True)
+    covered.to_csv(outdir / "predictions.csv", index=False, float_format="%.6f")
+    _write_json(outdir / "report.json", rep)
+    lines = [f"Injury-aware comparison (out-of-sample, chronological): {rep['n']} games with both teams' reports before "
+             f"the prediction time, {rep['first_date']} -> {rep['last_date']}"]
+    lines += [f"  season {c['season']}: {c['covered']} of {c['games']} games covered" for c in rep["coverage"]]
+    lines.append(f"  {'model':<36} {'log loss':>8} {'brier':>7} {'acc':>6} {'ece':>6} {'slope':>6}   log-loss diff vs champion [95% CI]")
+    for c, name in availability_study.VARIANTS.items():
+        v = rep["overall"][c]
+        lines.append(f"  {name:<36} {v['log_loss']:>8.4f} {v['brier']:>7.4f} {v['accuracy']:>6.3f} {v['ece']:>6.3f} "
+                     f"{v['calibration_slope']:>6.2f}   {fmt_ci_short(v.get('log_loss_diff_vs_base'))}")
+    best = rep["decision"]["best"]
+    groups = [(k, rep["by_segment"][k]) for k in rep["by_segment"]] + [(f"season {k}", v) for k, v in rep["by_season"].items()]
+    groups += [("injury-heavy (top quartile |impact|)", rep["injury_heavy"]),
+               ("unresolved uncertainty (top quartile sd)", rep["unresolved_uncertainty"])]
+    lines.append(f"  {best} vs champion, by group:")
+    lines += [f"    {k:<42} n={v['n']:<5} {fmt_ci_short(v[best].get('log_loss_diff_vs_base'))}" for k, v in groups]
+    diag = rep["feature_diagnostics"]["margin_per_impact_point"]
+    lines.append(f"  actual margin per point of predicted impact, given the Elo gap: {diag['slope']:.2f} (se {diag['se']:.2f})")
+    lines.append(f"  market comparison: {rep['market']['note']}")
+    d = rep["decision"]
+    lines.append(f"  best: {d['best']}; ADOPT: {d['adopt']}")
+    lines.append(f"  rule: {d['rule']}. {d['multiple_testing_note']}.")
+    text = "\n".join(lines)
+    (outdir / "summary.txt").write_text(text + "\n")
+    print(text)
+    print(f"wrote {outdir}/ (nothing changed in production: models and today's predictions are untouched)")
+    return 0
+
+
 def cmd_blend_study(args, cfg):
     ev = cfg["evaluation"]
     base = args.base or cfg.get("blend", {}).get("base_col", "p_logistic_raw")
@@ -1076,7 +1145,9 @@ def build_parser():
         sp.add_argument("--book", help='bookmaker key or "best"')
         return sp
 
-    common(sub.add_parser("build-dataset", help="write the training dataset")).add_argument("--out")
+    bd = common(sub.add_parser("build-dataset", help="write the training dataset"))
+    bd.add_argument("--out")
+    bd.add_argument("--availability", action="store_true", help="add the injury-report availability columns")
     wf = common(sub.add_parser("walk-forward", help="development walk-forward backtest"))
     wf.add_argument("--out")
     wf.add_argument("--retrain", choices=["weekly", "monthly", "season"])
@@ -1149,6 +1220,10 @@ def build_parser():
     io.add_argument("--csv", required=True)
     io.add_argument("--games")
     io.add_argument("--provider", default="the-odds-api")
+    ast = sub.add_parser("availability-study", help="injury-aware models vs the champion on development games")
+    ast.add_argument("--rebuild-features", action="store_true", help="recompute the cached availability features")
+    ast.add_argument("--features-only", action="store_true", help="build the features and stop")
+    ast.add_argument("--out")
     bs = sub.add_parser("blend-study", help="early-season Elo blending study on development predictions")
     bs.add_argument("--base", help="ML probability column (default from config)")
     bs.add_argument("--confirm-holdout", action="store_true", help="score the chosen blend once on the final holdout")
@@ -1184,7 +1259,7 @@ COMMANDS = {"build-dataset": cmd_build_dataset, "walk-forward": cmd_walk_forward
             "uncertainty-fit": cmd_uncertainty_fit, "results-update": cmd_results_update, "players-backfill": cmd_players_backfill, "injuries-refresh": cmd_injuries_refresh, "injuries-backfill": cmd_injuries_backfill,
             "injuries-status": cmd_injuries_status,
             "odds-status": cmd_odds_status,
-            "import-odds": cmd_import_odds, "blend-study": cmd_blend_study, "market-benchmark": cmd_market_benchmark,
+            "import-odds": cmd_import_odds, "blend-study": cmd_blend_study, "availability-study": cmd_availability_study, "market-benchmark": cmd_market_benchmark,
             "paper-trade": cmd_paper_trade, "today": cmd_today,
             "weekly-report": cmd_weekly_report}
 

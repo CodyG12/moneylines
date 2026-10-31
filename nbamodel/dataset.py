@@ -13,8 +13,9 @@ timestamps that say what information the features could have used:
   source_fetched_at          when the source rows were downloaded (if recorded)
   train_eligible             played, and both teams have >= min_history earlier games
 
-Injury/lineup features are not included: no reliable timestamped historical
-source is wired in. See nbamodel/availability.py for the ingestion adapter.
+Injury/lineup features are optional columns added by `attach_availability`, from official reports
+published before the prediction time (nbamodel/player_impact.py). Games without a report keep NaN
+with report_available = 0. They are not in FEATURES_V2, so production models do not use them.
 """
 from __future__ import annotations
 
@@ -47,6 +48,17 @@ DIAGNOSTICS = ["home_elo_pre", "away_elo_pre", "elo_home_prob", "home_season_gam
 # Present only when odds were attached (data.prepare_games / odds_join); never model inputs.
 ODDS_COLUMNS = ["home_odds", "away_odds", "odds_timestamp", "odds_book", "close_home_odds", "close_away_odds",
                 "close_odds_timestamp"]
+
+
+AVAILABILITY_FEATURES = ["injury_impact_diff", "injury_impact_sd", "rotation_out_diff", "rotation_uncertain_diff",
+                         "report_available"]
+
+
+def attach_availability(ds: pd.DataFrame, features: pd.DataFrame) -> pd.DataFrame:
+    """Join player_impact.dataset_features rows on game_key. Games with no row have no report."""
+    out = ds.merge(features, on="game_key", how="left", validate="one_to_one")
+    out["report_available"] = out["report_available"].fillna(0).astype(int)
+    return out
 
 
 def prediction_timestamps(dates: pd.Series, tipoff: pd.Series, lead_minutes: float):
