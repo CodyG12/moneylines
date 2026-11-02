@@ -256,3 +256,29 @@ def availability_features(rows: pd.DataFrame, changes: pd.DataFrame, first_repor
     out["injury_impact_diff"] = out["home_impact"] - out["away_impact"]
     out["injury_impact_sd"] = np.sqrt(out["home_impact_sd"] ** 2 + out["away_impact_sd"] ** 2)
     return out
+
+
+def both_reported(f: pd.DataFrame) -> pd.Series:
+    """1 when the game's two teams both have a report at prediction time."""
+    return ((f["home_report_available"] == 1) & (f["away_report_available"] == 1)).astype(int)
+
+
+def dataset_features(rows: pd.DataFrame, changes: pd.DataFrame, first_report: pd.Series, pg: pd.DataFrame,
+                     cfg: ImpactConfig = ImpactConfig()) -> pd.DataFrame:
+    """Columns for dataset.attach_availability: availability_features for rows on dates that have
+    any report, keyed by game_key, with home-minus-away differences of the rotation counts."""
+    days = pd.to_datetime(rows["date"]).dt.date.astype(str)
+    r = rows[days.isin(first_report.index)].reset_index(drop=True)
+    f = availability_features(r, changes, first_report, pg, cfg)
+    f.insert(0, "game_key", r["game_key"].to_numpy())
+    f["rotation_out_diff"] = f["home_n_rotation_out"] - f["away_n_rotation_out"]
+    f["rotation_uncertain_diff"] = f["home_n_rotation_uncertain"] - f["away_n_rotation_uncertain"]
+    f["report_available"] = both_reported(f)
+    return f
+
+
+def load_player_games(cons) -> pd.DataFrame:
+    """Box-score rows from one or more databases (the backfilled history and the live archive)."""
+    frames = [pd.read_sql("SELECT espn_event_id, player_id, game_key, game_date, team, home, player_name, "
+                          "did_not_play, minutes, pts FROM player_games", con) for con in cons]
+    return pd.concat(frames, ignore_index=True).drop_duplicates(["espn_event_id", "player_id"])

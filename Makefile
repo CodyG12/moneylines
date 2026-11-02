@@ -4,7 +4,7 @@ SEASON ?= 2026-27
 NBA = $(PY) -m nbamodel
 
 .PHONY: test data-fetch data-update dataset walk-forward final-test train predict update-results retrain dashboard daily phase1 \
-        collect-odds odds-plan odds-status blend-study market-benchmark paper-trade today today-local weekly-report \
+        collect-odds odds-plan odds-status blend-study availability-study market-benchmark paper-trade today today-local weekly-report \
         pull seed-state results-update
 
 test:            ## full pytest suite
@@ -56,6 +56,9 @@ odds-status:     ## collection runs and per-game snapshot coverage
 
 blend-study:     ## early-season Elo blending study (development data; one holdout confirmation)
 	$(NBA) blend-study
+
+availability-study: ## injury-aware models vs the champion on development games -> out/availability/
+	$(NBA) availability-study
 
 market-benchmark: ## models vs no-vig market at matching prediction times
 	$(NBA) market-benchmark
